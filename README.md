@@ -1,10 +1,22 @@
 # herdr-hibernate
 
-Auto-hibernates idle Claude Code tabs in Herdr. Each idle Claude tab holds
-650–930 MB (the `claude` process plus its MCP server children). This tool kills
-that process tree and leaves a tiny bash stub (a few MB) in the pane. Pressing
-Enter in the pane resumes the exact session with full history via
-`claude --resume <uuid>`.
+Auto-hibernates idle coding-agent tabs in Herdr. Each idle agent tab holds
+hundreds of MB to several GB (the agent process plus its MCP server children).
+This tool kills that process tree and leaves a tiny bash stub (a few MB) in
+the pane. Pressing Enter in the pane resumes the exact session with full
+history.
+
+Supported agents:
+
+| Agent | Resume command | Typical RAM freed |
+|---|---|---|
+| Claude Code | `claude --resume <uuid>` | 650–930 MB |
+| Codex CLI | `codex resume <uuid>` | ~550 MB (multi-GB after sub-agent runs) |
+| Grok (xAI Grok Build) | `grok --resume <uuid> --cwd <dir>` | ~35 MB + your MCP servers (~500 MB typical) |
+
+Only agents with a proven on-disk resume path are ever touched; anything else
+is exempt — killing a session that cannot be resumed would lose the
+conversation.
 
 Panes and tabs are **never closed** — only processes inside them are killed.
 
@@ -38,15 +50,31 @@ The first runs are **dry-run by default** (`DRY_RUN=1`): the tool only logs
 what it *would* hibernate. Review `~/.config/herdr-hibernate/hibernate.log`,
 then set `DRY_RUN=0` in the config to arm it.
 
-## Why killing claude is safe
+## Why killing the agent is safe
 
-Claude Code writes its session transcript to
-`~/.claude/projects/<project-dir>/<session-uuid>.jsonl` continuously; nothing
-is held only in memory once the agent is idle. `claude --resume <uuid>`
-restores the full conversation. The only thing a kill can lose is in-flight
-work, which is why the tool only ever touches panes whose agent status is
-`idle` or `done` AND whose transcript has been quiet past the threshold —
-and re-checks the status immediately before killing.
+All supported agents write their session transcript to disk continuously;
+nothing is held only in memory once the agent is idle. The only thing a kill
+can lose is in-flight work, which is why the tool only ever touches panes
+whose agent status is `idle` or `done` AND whose transcript has been quiet
+past the threshold — and re-checks the status immediately before killing.
+
+- **Claude Code**: transcript at
+  `~/.claude/projects/<project-dir>/<session-uuid>.jsonl`;
+  `claude --resume <uuid>` restores the full conversation.
+- **Codex CLI**: rollout file at
+  `~/.codex/sessions/<y>/<m>/<d>/rollout-<timestamp>-<uuid>.jsonl`;
+  `codex resume <uuid>` restores the full conversation, appends to the same
+  file, and keeps the same session id — so the mapping stays stable across
+  any number of hibernate/resume cycles. `-c`/`--model`/`--profile` flags
+  from the killed process are replayed on resume so overrides survive.
+- **Grok**: session dir at `~/.grok/sessions/<encoded-cwd>/<uuid>/`, with
+  `updates.jsonl` as the authoritative conversation log; `grok --resume
+  <uuid> --cwd <dir>` restores the full conversation. Herdr has no grok
+  integration and reports no session id, so the tool recovers it from grok's
+  own `~/.grok/active_sessions.json`, matching the pane's process pid + cwd.
+  Not restored by grok on resume (grok's design, not this tool's): background
+  tasks, plan-mode state, and staged/unstaged changes under `--restore-code`;
+  MCP servers are re-initialized from grok's config.
 
 ## Usage
 
@@ -182,7 +210,7 @@ Two mechanisms:
 - Panes whose agent status is `working` or `blocked`.
 - Pinned tabs (either mechanism above).
 - The pane the reaper itself runs in.
-- Non-claude agents (codex etc.) — v1 is Claude-only.
+- Agents without a proven resume path (anything not in the table above).
 - Panes with no session uuid or no transcript file (they could not be resumed,
   so they are never killed).
 - Panes already hibernated (stub waiting).
@@ -276,7 +304,11 @@ from you. To check it worked:
   run `install` again from a live pane.
 - Tab-id pins (`PINNED_TABS`) do not survive Herdr restarts; label-marker
   pins do.
-- v1 handles Claude Code only.
+- Handles Claude Code, Codex, and Grok. Other agents are exempt until they
+  have a proven resume path.
+- While Codex runs sub-agents, its parent transcript can look stale; the
+  `working` status guard (hook-driven) is what protects those panes.
 - macOS is untested (see [Install](#install)).
-- If a pane runs multiple claude processes, or a claude naming a different
-  session uuid than Herdr reports, the tool refuses to act on it.
+- If a pane runs multiple agent processes (beyond a wrapper and its own
+  child, e.g. codex's node shim), or an agent naming a different session id
+  than expected, the tool refuses to act on it.

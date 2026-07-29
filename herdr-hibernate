@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""herdr-hibernate — auto-hibernate idle Claude Code tabs in Herdr.
+"""herdr-hibernate — auto-hibernate idle coding-agent tabs in Herdr.
 
-Kills the claude process tree of idle panes (freeing 650-930 MB each) and
+Kills the agent process tree of idle panes (freeing 500 MB-2 GB each) and
 replaces it with a tiny bash stub that resumes the exact session on Enter.
-Panes and tabs are never closed. Dry-run by default.
+Supports Claude Code, Codex, and Grok; only agents with a proven on-disk
+resume path are ever touched. Panes and tabs are never closed. Dry-run by
+default.
 
 Hibernation survives reboots: each hibernated pane gets a stub script under
 ~/.config/herdr-hibernate/panes/. A .bashrc hook re-arms that stub the moment
@@ -36,16 +38,80 @@ LOG_FILE = os.path.join(CONFIG_DIR, "hibernate.log")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 PANES_DIR = os.path.join(CONFIG_DIR, "panes")
 PID_FILE = os.path.join(CONFIG_DIR, "watch.pid")
-TRANSCRIPT_GLOB = os.path.expanduser("~/.claude/projects/*/{uuid}.jsonl")
 SYSTEMD_UNIT = os.path.expanduser("~/.config/systemd/user/herdr-hibernate.service")
 SELF = os.path.abspath(__file__)
 SHELL_HOOK_MARK = "# >>> herdr-hibernate pane stub hook >>>"
+
+UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+# Per-agent adapters — herdr's `agent` value -> how to measure idle time, find
+# the process, and resume a killed session. Only agents listed here are ever
+# hibernated: killing anything without a proven resume path would lose the
+# conversation, so unknown agents are exempt.
+#
+#   transcript_glob  where the session's on-disk transcript lives ({sid} = the
+#                    id Herdr reports in agent_session.value)
+#   bin              executable name; used to spot the agent among the pane's
+#                    foreground processes (argv[0] or argv[1] basename, so a
+#                    `node .../bin/codex` wrapper matches too)
+#   resume_argv      command that resumes session {sid} (run in the pane's cwd)
+#   session_in_args  regex whose group(1) is the session id when it appears in
+#                    a running process's args (resumed sessions only)
+#   helper_tokens    cmdline substrings marking helper processes to ignore
+#   replay_flags     flags captured from the killed process's argv and appended
+#                    to resume_argv, so a resume keeps e.g. the model override
+AGENTS = {
+    "claude": {
+        "transcript_glob": os.path.expanduser("~/.claude/projects/*/{sid}.jsonl"),
+        "bin": "claude",
+        "resume_argv": ["claude", "--resume", "{sid}"],
+        "session_in_args": r"--resume\s+(%s)" % UUID_RE,
+        "helper_tokens": ("bg-pty-host", "bg-spare", " daemon "),
+        "replay_flags": (),
+    },
+    "codex": {
+        # rollout-<local-timestamp>-<uuid>.jsonl, nested by year/month/day.
+        # `codex resume` appends to this same file and keeps the same id, so
+        # the mapping is stable across any number of hibernate/resume cycles.
+        "transcript_glob": os.path.expanduser(
+            "~/.codex/sessions/*/*/*/rollout-*-{sid}.jsonl"),
+        "bin": "codex",
+        "resume_argv": ["codex", "resume", "{sid}"],
+        "session_in_args": r"resume\s+(%s)" % UUID_RE,
+        "helper_tokens": (),
+        # Flags that must survive a resume: config overrides, model/profile
+        # choices, and — important for safety — sandbox/approval settings and
+        # working roots, so a resumed session is never LESS restricted than
+        # the one that was killed. Anything unlisted is dropped (a stray
+        # positional would become a prompt!).
+        "replay_flags": ("-c", "-m", "--model", "-p", "--profile",
+                         "-s", "--sandbox", "-a", "--ask-for-approval",
+                         "-C", "--cd", "--add-dir"),
+        "replay_bool_flags": ("--oss",),
+    },
+    "grok": {
+        # xAI Grok Build. The session dir is named by the session uuid, nested
+        # under a percent-encoded copy of the session's cwd.
+        "transcript_glob": os.path.expanduser("~/.grok/sessions/*/{sid}/*.jsonl"),
+        "bin": "grok",
+        # Session ids are global across cwds, but --cwd sidesteps a legacy
+        # duplicate-id edge case in grok's sandbox-profile lookup.
+        "resume_argv": ["grok", "--resume", "{sid}", "--cwd", "{cwd}"],
+        "session_in_args": r"--resume\s+(%s)" % UUID_RE,
+        "helper_tokens": (),
+        "replay_flags": (),
+        # grok transcripts stamp entries with epoch integers, not ISO strings.
+        # Only enabled here: a numeric "timestamp" inside claude/codex tool
+        # output must not be mistaken for an entry timestamp.
+        "epoch_ts": True,
+    },
+}
 
 # (key, default, comment) — drives both the generated config file and the
 # in-memory defaults, and lets load_config() append keys added by an upgrade.
 CONFIG_KEYS = [
     ("HIBERNATE_AFTER_MINUTES", "30",
-     "Hibernate a claude pane after this many minutes without transcript writes."),
+     "Hibernate an agent pane after this many minutes without transcript writes."),
     ("SCAN_INTERVAL_SECONDS", "120",
      "Seconds between scans in `watch` mode."),
     ("PIN_MARKER", "📌",
@@ -202,10 +268,29 @@ def save_state(state):
 
 
 TS_RE = re.compile(rb'"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)')
+TS_EPOCH_RE = re.compile(rb'"timestamp"\s*:\s*(\d{9,12})\b')  # grok: epoch ints
 TAIL_BYTES = 2 * 1024 * 1024
 
 
-def last_entry_epoch(path):
+def _stamp_epochs(chunk, allow_epoch=False):
+    """All parseable entry timestamps in a transcript chunk, as epoch seconds."""
+    out = []
+    for iso in TS_RE.findall(chunk):
+        try:
+            out.append(calendar.timegm(
+                time.strptime(iso.decode("ascii", "ignore"),
+                              "%Y-%m-%dT%H:%M:%S")))
+        except ValueError:
+            pass
+    if allow_epoch:
+        for num in TS_EPOCH_RE.findall(chunk):
+            val = int(num)
+            if 1_000_000_000 <= val <= 4_102_444_800:  # sane range: 2001..2100
+                out.append(val)
+    return out
+
+
+def last_entry_epoch(path, allow_epoch=False):
     """Epoch of the newest timestamped entry in a transcript, or None.
 
     The file's mtime is NOT a usable idle signal: Claude Code keeps rewriting
@@ -219,28 +304,23 @@ def last_entry_epoch(path):
         with open(path, "rb") as fh:
             if size > TAIL_BYTES:
                 fh.seek(size - TAIL_BYTES)
-            chunk = fh.read()
-            stamps = TS_RE.findall(chunk)
+            stamps = _stamp_epochs(fh.read(), allow_epoch)
             if not stamps and size > TAIL_BYTES:  # rare: no stamps in the tail
                 fh.seek(0)
-                stamps = TS_RE.findall(fh.read())
+                stamps = _stamp_epochs(fh.read(), allow_epoch)
     except OSError:
         return None
-    if not stamps:
-        return None
-    # Timestamps are UTC ("...Z"); ISO-8601 strings sort chronologically.
-    newest = max(stamps).decode("ascii", "ignore")
-    try:
-        return calendar.timegm(time.strptime(newest, "%Y-%m-%dT%H:%M:%S"))
-    except ValueError:
-        return None
+    return max(stamps) if stamps else None
 
 
-def transcript_age_minutes(uuid):
+def transcript_age_minutes(uuid, agent="claude"):
     """Minutes since this session's last real activity, or None if no transcript."""
+    spec = AGENTS.get(agent)
+    if spec is None:
+        return None
     newest = None
-    for path in glob.glob(TRANSCRIPT_GLOB.format(uuid=uuid)):
-        stamp = last_entry_epoch(path)
+    for path in glob.glob(spec["transcript_glob"].format(sid=uuid)):
+        stamp = last_entry_epoch(path, spec.get("epoch_ts", False))
         if stamp is None:  # unreadable/unstamped — fall back to the file clock
             try:
                 stamp = os.stat(path).st_mtime
@@ -339,45 +419,133 @@ def collect_panes():
 
 def session_uuid(pane):
     sess = pane.get("agent_session")
-    if isinstance(sess, dict):
-        return sess.get("value")
+    if isinstance(sess, dict) and sess.get("value"):
+        return sess["value"]
+    if pane.get("agent") == "grok":
+        return grok_session_id(pane)
     return None
 
 
-def find_claude_proc(pane_id, uuid):
-    """The root claude process of a pane, from herdr's process info.
+def grok_session_id(pane):
+    """Recover a grok pane's session id from grok's own registry.
 
-    Returns (pid, cmdline) or (None, reason).
+    Herdr has no grok integration, so agent_session is never populated. Grok
+    itself records {session_id, pid, cwd} per live session; match the pane's
+    grok process pid against it (pid alone could be recycled, so cwd must
+    agree too). A crashed session can leave a stale entry behind — matching
+    against the pane's CURRENT foreground pids filters those out.
     """
-    info = herdr("pane", "process-info", "--pane", pane_id)["process_info"]
+    info = pane_process_info(pane["pane_id"])
+    if not info:
+        return None
+    pids = {p.get("pid") for p in info.get("foreground_processes") or []
+            if p.get("pid") and _matches_agent(p, "grok")}
+    if not pids:
+        return None
+    try:
+        with open(os.path.expanduser("~/.grok/active_sessions.json"),
+                  encoding="utf-8") as fh:
+            entries = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    for entry in entries if isinstance(entries, list) else []:
+        if entry.get("pid") not in pids or entry.get("cwd") != pane.get("cwd"):
+            continue
+        # pid+cwd can BOTH repeat if the OS recycled the pid for a new grok in
+        # the same directory. A legit entry is written at process launch, so
+        # its opened_at must sit near the live process's start time.
+        opened, up = entry.get("opened_at"), proc_uptime_minutes(entry["pid"])
+        if opened and up is not None:
+            try:
+                opened_epoch = calendar.timegm(
+                    time.strptime(opened, "%Y-%m-%dT%H:%M:%SZ"))
+                if abs((time.time() - up * 60) - opened_epoch) > 600:
+                    continue  # stale entry from a dead session; pid recycled
+            except ValueError:
+                pass  # unparseable opened_at — don't reject on formatting
+        return entry.get("session_id")
+    return None
+
+
+_INTERPRETERS = ("node", "bun", "deno", "python", "python3")
+
+
+def _matches_agent(p, bin_name):
+    if p.get("name") == bin_name:
+        return True
+    argv = p.get("argv") or []
+    if not argv:
+        return False
+    if os.path.basename(argv[0]) in (bin_name, bin_name + ".js"):
+        return True
+    # An interpreter wrapper (`node .../bin/codex ...`) puts the agent's name
+    # second — but ONLY behind a known interpreter, or `vim codex` matches too.
+    return (len(argv) > 1
+            and os.path.basename(argv[0]) in _INTERPRETERS
+            and os.path.basename(argv[1]) in (bin_name, bin_name + ".js"))
+
+
+def find_agent_proc(pane_id, uuid, agent):
+    """The root process of a pane's agent, from herdr's process info.
+
+    Returns (pid, proc-dict) or (None, reason).
+    """
+    spec = AGENTS.get(agent)
+    if spec is None:
+        return None, "unsupported agent %s" % agent
+    info = pane_process_info(pane_id)
+    if not info:
+        return None, "no process info for pane"
     procs = info.get("foreground_processes") or []
-    claudes = [
-        p for p in procs
-        if p.get("name") == "claude"
-        or (p.get("argv") and os.path.basename(p["argv"][0]) == "claude")
-    ]
-    # Ignore claude helper processes that are not an interactive session.
-    claudes = [
-        p for p in claudes
+    found = [p for p in procs if _matches_agent(p, spec["bin"])]
+    # Ignore helper processes that are not an interactive session.
+    found = [
+        p for p in found
         if not any(tok in p.get("cmdline", "")
-                   for tok in ("bg-pty-host", "bg-spare", " daemon "))
+                   for tok in spec["helper_tokens"])
     ]
-    if not claudes:
-        return None, "no claude process in pane foreground"
+    if not found:
+        return None, "no %s process in pane foreground" % agent
     if uuid:
-        matched = [p for p in claudes if uuid in p.get("cmdline", "")]
+        matched = [p for p in found if uuid in p.get("cmdline", "")]
         if matched:
-            claudes = matched
+            found = matched
         else:
-            # A bare `claude` (no --resume) carries no uuid in args; accept it
-            # only if it names no OTHER session uuid.
-            for p in claudes:
-                other = re.search(r"--resume\s+([0-9a-f-]{36})", p.get("cmdline", ""))
+            # A freshly started agent carries no session id in args; accept it
+            # only if it names no OTHER session id.
+            for p in found:
+                other = re.search(spec["session_in_args"], p.get("cmdline", ""))
                 if other and other.group(1) != uuid:
-                    return None, "pane claude runs a different session (%s)" % other.group(1)
-    if len(claudes) > 1:
-        return None, "multiple claude processes in pane; refusing to guess"
-    return claudes[0]["pid"], claudes[0].get("cmdline", "")
+                    return None, "pane %s runs a different session (%s)" % (
+                        agent, other.group(1))
+    if len(found) > 1:
+        # A wrapper and its child both match (node shim + vendored codex
+        # binary). Collapse to the wrapper ONLY for that exact shape: two
+        # processes, direct parent/child, same arguments after the agent name.
+        # Anything else (e.g. a nested second session) is refused — collapsing
+        # there would kill a session the tool has no record for.
+        def _tail(p):
+            argv = p.get("argv") or []
+            for i, tok in enumerate(argv):
+                if os.path.basename(tok) in (spec["bin"], spec["bin"] + ".js"):
+                    return argv[i + 1:]
+            return None
+
+        collapsed = None
+        if len(found) == 2 and all(p.get("pid") for p in found):
+            procs_all = ps_snapshot()
+            a, b = found
+            for parent, child in ((a, b), (b, a)):
+                direct = procs_all.get(child["pid"], (None,))[0] == parent["pid"]
+                if direct and _tail(parent) == _tail(child) is not None:
+                    collapsed = parent
+                    break
+        if collapsed is None:
+            return None, "multiple %s processes in pane; refusing to guess" % agent
+        found = [collapsed]
+    if not found[0].get("pid"):
+        return None, "pane process info carries no pid"
+    return found[0]["pid"], found[0]
 
 
 # ------------------------------------------------------------ classification
@@ -395,8 +563,8 @@ def classify(pane, tab_labels, cfg, state, self_pane):
     agent = pane.get("agent")
     if not agent:
         return "skip", "no agent in pane"
-    if agent != "claude":
-        return "exempt", "non-claude agent (%s); v1 is Claude-only" % agent
+    if agent not in AGENTS:
+        return "exempt", "agent %s has no proven resume path" % agent
 
     status = pane.get("agent_status", "unknown")
     if status in ("working", "blocked"):
@@ -416,8 +584,12 @@ def classify(pane, tab_labels, cfg, state, self_pane):
     uuid = session_uuid(pane)
     if not uuid:
         return "skip", "no session uuid — could not resume, never killing"
+    if not re.fullmatch(UUID_RE, uuid):
+        # `codex resume` also accepts session NAMES; a non-uuid could silently
+        # resolve to a different session. Only kill what we can name exactly.
+        return "skip", "session id %r is not a uuid — never killing" % uuid[:40]
 
-    age = transcript_age_minutes(uuid)
+    age = transcript_age_minutes(uuid, agent)
     if age is None:
         return "skip", "no transcript file found for %s — cannot verify/resume" % uuid
     threshold = float(cfg["HIBERNATE_AFTER_MINUTES"])
@@ -429,15 +601,16 @@ def classify(pane, tab_labels, cfg, state, self_pane):
 
 # -------------------------------------------------------------- hibernation
 
-def kill_tree(root, grace_seconds, protected):
+def kill_tree(root, grace_seconds, protected, bin_name):
     """SIGTERM the whole tree rooted at `root`, SIGKILL survivors."""
     procs = ps_snapshot()
     if root not in procs:
         return False, "process %d already gone" % root
     if root in protected or root == 1:
         return False, "refusing to kill protected pid %d" % root
-    if "claude" not in procs[root][2]:
-        return False, "pid %d is not a claude process (%s)" % (root, procs[root][2][:60])
+    if bin_name not in procs[root][2]:
+        return False, "pid %d is not a %s process (%s)" % (
+            root, bin_name, procs[root][2][:60])
     targets = [root] + descendants(root, procs)
     if protected & set(targets):
         return False, "own process inside kill tree; aborting"
@@ -471,7 +644,7 @@ shopt -s execfail
 # shell itself, killing it would close the whole tab.
 _hb_bye() {{
     printf '\\n\\033[1;31m%s\\033[0m\\n' 'hibernation stub dismissed.'
-    printf 'resume this session by hand with:  claude --resume %s\\n\\n' {uuid}
+    printf 'resume this session by hand with:  %s\\n\\n' {resume_display}
     exit 0
 }}
 trap _hb_bye INT
@@ -484,9 +657,9 @@ _hb_stub() {{
     printf 'resuming session %s (takes 10-20s)...\\n' {uuid}
     {herdr} tab rename {tab_id} {label} >/dev/null 2>&1
     # NOTE: the record and this script are deliberately NOT deleted here. The
-    # reaper clears them once it sees claude actually live in the pane, so a
+    # reaper clears them once it sees the agent actually live in the pane, so a
     # failed resume (or a Herdr restart mid-resume) still leaves the pane armed.
-    exec claude --resume {uuid}
+    exec {resume_cmd}
 }}
 _hb_stub
 _hb_bye
@@ -513,6 +686,27 @@ def since_str(at):
     return "?" if mins is None else fmt_idle(mins)
 
 
+def resume_argv(rec):
+    """The argv that resumes a record's session, e.g. ['codex', 'resume', <id>].
+
+    Prefers the argv captured at hibernation time (which carries replayed
+    flags); falls back to the adapter template for records written by older
+    versions, which were always Claude.
+    """
+    saved = rec.get("resume")
+    if isinstance(saved, list) and saved:
+        return saved
+    agent = rec.get("agent", "claude")
+    spec = AGENTS.get(agent)
+    if spec is None:
+        # Record from a newer version (or foreign data): never guess a resume
+        # command for an unknown agent — surface the id instead.
+        return ["echo", "cannot auto-resume unknown agent %r — session %s"
+                % (agent, rec.get("uuid"))]
+    cwd = rec.get("cwd") or os.path.expanduser("~")
+    return [tok.format(sid=rec["uuid"], cwd=cwd) for tok in spec["resume_argv"]]
+
+
 def write_stub_file(pane_id, rec):
     """(Re)write the pane's stub script from its state record. Returns its path."""
     os.makedirs(PANES_DIR, exist_ok=True)
@@ -520,10 +714,13 @@ def write_stub_file(pane_id, rec):
         since_str(rec.get("at", "")), rec.get("freed_mb", 0))
     subtitle = "session %s · %s · Ctrl-C for a plain shell" % (
         rec["uuid"], rec.get("cwd", ""))
+    resume = resume_argv(rec)
     path = pane_file(pane_id)
     body = STUB_TEMPLATE.format(
         pane_id=shlex.quote(pane_id),
         uuid=shlex.quote(rec["uuid"]),
+        resume_cmd=" ".join(shlex.quote(t) for t in resume),
+        resume_display=shlex.quote(" ".join(shlex.quote(t) for t in resume)),
         cwd=shlex.quote(rec.get("cwd") or os.path.expanduser("~")),
         tab_id=shlex.quote(rec.get("tab_id", "")),
         label=shlex.quote(rec.get("label", "")),
@@ -607,23 +804,67 @@ def toast(title, body="", sound="none"):
         pass
 
 
+def build_resume(agent, sid, proc, cwd):
+    """Resume argv for a session, with whitelisted flags replayed from the
+    process being killed (so e.g. a codex model override survives resume)."""
+    spec = AGENTS[agent]
+    base = [tok.format(sid=sid, cwd=cwd) for tok in spec["resume_argv"]]
+    keep = spec["replay_flags"]
+    argv = (proc or {}).get("argv") or []
+    if not keep or not argv:
+        return base
+    start = 0
+    for i, tok in enumerate(argv):
+        if os.path.basename(tok) in (spec["bin"], spec["bin"] + ".js"):
+            start = i + 1
+            break
+    bools = spec.get("replay_bool_flags", ())
+    tail, extra, i = argv[start:], [], 0
+    while i < len(tail):
+        tok = tail[i]
+        if tok in keep and i + 1 < len(tail):
+            extra += [tok, tail[i + 1]]
+            i += 2
+        elif "=" in tok and tok.split("=", 1)[0] in keep:  # --model=x form
+            extra.append(tok)
+            i += 1
+        elif tok in bools:
+            extra.append(tok)
+            i += 1
+        else:
+            i += 1
+    return base + extra
+
+
 def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False):
     pane_id = pane["pane_id"]
     tab_id = pane.get("tab_id", "")
     label = tab_labels.get(tab_id, "") or pane.get("label", "") or pane_id
     uuid = session_uuid(pane)
+    agent = pane.get("agent")
+    if agent not in AGENTS:
+        log("SKIP %s (%s): agent %s has no proven resume path" % (
+            label, pane_id, agent))
+        return False
+    # classify() proved a session id earlier, but for grok it is re-resolved
+    # live (registry lookup) and could have vanished in between. A kill with
+    # no resumable id must never happen, whatever the caller checked.
+    if not uuid or not re.fullmatch(UUID_RE, uuid):
+        log("SKIP %s (%s): no valid session id at kill time — never killing"
+            % (label, pane_id))
+        return False
 
-    pid, cmdline = find_claude_proc(pane_id, uuid)
+    pid, proc = find_agent_proc(pane_id, uuid, agent)
     if pid is None:
-        log("SKIP %s (%s): %s" % (label, pane_id, cmdline))
+        log("SKIP %s (%s): %s" % (label, pane_id, proc))
         return False
 
     # Killing the pane's own shell closes the tab. That is never acceptable —
-    # it can happen if claude replaced the shell (an `exec claude` stub).
+    # it can happen if the agent replaced the shell (an `exec claude` stub).
     info = pane_process_info(pane_id)
     if info and pid == info.get("shell_pid"):
-        log("SKIP %s (%s): claude is the pane's shell — killing it would close "
-            "the tab" % (label, pane_id))
+        log("SKIP %s (%s): %s is the pane's shell — killing it would close "
+            "the tab" % (label, pane_id, agent))
         return False
 
     # A session resumed a moment ago still has an old last-message timestamp
@@ -632,8 +873,8 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
     up = proc_uptime_minutes(pid)
     threshold = float(cfg["HIBERNATE_AFTER_MINUTES"])
     if not force and up is not None and up < threshold:
-        log("SKIP %s (%s): claude only started %s ago (likely just resumed)" % (
-            label, pane_id, fmt_idle(up)))
+        log("SKIP %s (%s): %s only started %s ago (likely just resumed)" % (
+            label, pane_id, agent, fmt_idle(up)))
         return False
 
     rss_mb = tree_rss_mb(pid, ps_snapshot())
@@ -650,7 +891,8 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
             label, pane_id, fresh.get("agent_status")))
         return False
 
-    ok, detail = kill_tree(pid, float(cfg["KILL_GRACE_SECONDS"]), own_ancestors())
+    ok, detail = kill_tree(pid, float(cfg["KILL_GRACE_SECONDS"]),
+                           own_ancestors(), AGENTS[agent]["bin"])
     if not ok:
         log("ABORT %s (%s): %s" % (label, pane_id, detail))
         return False
@@ -658,7 +900,9 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
     time.sleep(1.0)  # let the pane shell come back to its prompt
     cwd = pane.get("cwd") or os.path.expanduser("~")
     rec = {
-        "uuid": uuid, "tab_id": tab_id, "label": label, "cwd": cwd,
+        "uuid": uuid, "agent": agent,
+        "resume": build_resume(agent, uuid, proc, cwd),
+        "tab_id": tab_id, "label": label, "cwd": cwd,
         "freed_mb": rss_mb, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     # Record + stub file first: if anything below fails, the .bashrc hook and
@@ -758,7 +1002,7 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
             continue
         if rec.pop("missing_since", None) is not None:
             save_state(state)  # pane came back — cancel the pending forget
-        if transcript_age_minutes(rec["uuid"]) is None:
+        if transcript_age_minutes(rec["uuid"], rec.get("agent", "claude")) is None:
             # No transcript means nothing to resume — the record is dead weight.
             if not dry_run:
                 forget_record(pane_id, state, "session transcript is gone")
@@ -788,10 +1032,10 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                     log("ARMED %s (%s): wrote stub script for reboot recovery"
                         % (label, pane_id), echo=False)
             continue
-        if pane.get("agent") == "claude":
-            # Claude is live in the pane again — the stub did its job. (Accept
-            # any session uuid: right after a resume Herdr may not have picked
-            # the session identity up yet.)
+        if pane.get("agent") == rec.get("agent", "claude"):
+            # The agent is live in the pane again — the stub did its job.
+            # (Accept any session uuid: right after a resume Herdr may not have
+            # picked the session identity up yet.)
             if not dry_run:
                 log("RESUMED %s (%s)" % (label, pane_id), echo=False)
                 del state[pane_id]
@@ -853,9 +1097,13 @@ def cmd_scan(cfg=None):
         mode, cfg["HIBERNATE_AFTER_MINUTES"], len(panes)))
     count = 0
     for pane in panes:
-        decision, reason = classify(pane, tab_labels, cfg, state, self_pane)
         pane_id = pane["pane_id"]
         label = tab_labels.get(pane.get("tab_id", ""), "") or pane.get("label", "") or "(unnamed)"
+        try:
+            decision, reason = classify(pane, tab_labels, cfg, state, self_pane)
+        except Exception as exc:  # one bad pane must not kill the whole pass
+            log("ERROR classifying %s (%s): %s" % (label, pane_id, exc))
+            continue
         if decision == "hibernate":
             # One pane must never abort the pass: a tab closed mid-scan makes
             # the herdr call fail, and the remaining panes still need a look.
@@ -956,7 +1204,7 @@ def cmd_hibernate(pane_id, force=False, notify=False):
     if decision == "skip" and not reason.startswith("idle only"):
         fail("cannot hibernate: %s" % reason)
     uuid = session_uuid(pane)
-    idle = fmt_idle(transcript_age_minutes(uuid))
+    idle = fmt_idle(transcript_age_minutes(uuid, pane.get("agent", "claude")))
     before = len(state)
     hibernate_pane(pane, tab_labels, cfg, state, idle, dry_run, force=force)
     if dry_run:
@@ -993,7 +1241,7 @@ def cmd_forget(pane_id, resumed=False):
 
 
 SHELL_HOOK = """%s
-# Re-arm a hibernated Claude session when Herdr spawns a fresh shell in a pane.
+# Re-arm a hibernated agent session when Herdr spawns a fresh shell in a pane.
 # This is what makes hibernation survive a reboot: the stub process dies with
 # Herdr, but its script lives on disk and this hook runs it again.
 # Run it as a CHILD (no exec) so this shell stays the pane's shell — claude is
@@ -1048,9 +1296,11 @@ def cmd_status():
         pane_id = pane["pane_id"]
         label = (tab_labels.get(pane.get("tab_id", ""), "")
                  or pane.get("label", "") or "(unnamed)")[:28]
-        status = pane.get("agent_status", "-") if pane.get("agent") else "-"
+        agent = pane.get("agent") or ""
+        status = pane.get("agent_status", "-") if agent else "-"
         uuid = session_uuid(pane)
-        idle = fmt_idle(transcript_age_minutes(uuid)) if uuid else "-"
+        idle = (fmt_idle(transcript_age_minutes(uuid, agent))
+                if uuid and agent in AGENTS else "-")
         decision, reason = classify(pane, tab_labels, cfg, state, self_pane)
         tag = {"hibernate": "WOULD HIBERNATE", "exempt": "EXEMPT — " + reason,
                "skip": reason}[decision]
@@ -1058,16 +1308,16 @@ def cmd_status():
             # Show the guards hibernate_pane applies, so this table cannot
             # promise a kill that would actually be refused.
             try:
-                pid, _ = find_claude_proc(pane_id, uuid)
+                pid, _ = find_agent_proc(pane_id, uuid, agent)
             except RuntimeError:
                 pid = None
             if pid:
                 info = pane_process_info(pane_id)
                 up = proc_uptime_minutes(pid)
                 if info and pid == info.get("shell_pid"):
-                    tag = "PROTECTED — claude is the pane's shell"
+                    tag = "PROTECTED — %s is the pane's shell" % agent
                 elif up is not None and up < float(threshold):
-                    tag = "PROTECTED — claude started %s ago" % fmt_idle(up)
+                    tag = "PROTECTED — %s started %s ago" % (agent, fmt_idle(up))
         print(fmt % (pane_id, label, status, idle, tag))
     state = load_state()
     if state:
