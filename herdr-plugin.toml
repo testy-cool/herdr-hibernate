@@ -1,0 +1,50 @@
+id = "bengemine.hibernate"
+name = "Herdr Hibernate"
+version = "1.0.0"
+min_herdr_version = "0.7.0"
+description = "Hibernate idle Claude Code panes to ~0 RAM — kill the process tree, leave a tiny resume stub, press Enter to get the exact session back."
+# Tested on Linux and WSL2. macOS is untested: the background watcher falls back
+# from systemd --user to a nohup loop, which should work there, but no macOS
+# machine has verified it yet. Reports welcome.
+platforms = ["linux"]
+
+# Everything is one dependency-free Python 3 script; there is no build step.
+# State and config live in ~/.config/herdr-hibernate/ (not the plugin dirs) on
+# purpose: the watcher also runs outside Herdr-injected environments (systemd
+# unit, .bashrc stub hook), and all paths must agree on one location.
+
+[[actions]]
+id = "status"
+title = "Hibernate: status table"
+contexts = ["workspace"]
+command = ["./herdr-hibernate", "status"]
+
+[[actions]]
+id = "scan"
+title = "Hibernate: scan once"
+contexts = ["workspace"]
+command = ["./herdr-hibernate", "scan"]
+
+[[actions]]
+id = "now"
+title = "Hibernate focused pane now"
+contexts = ["pane", "workspace"]
+command = ["./herdr-hibernate", "now"]
+
+[[actions]]
+id = "restore"
+title = "Hibernate: re-arm stubs"
+contexts = ["workspace"]
+command = ["./herdr-hibernate", "restore"]
+
+[[actions]]
+id = "install"
+title = "Hibernate: install watcher + shell hook"
+contexts = ["workspace"]
+command = ["./herdr-hibernate", "install"]
+
+[[actions]]
+id = "uninstall"
+title = "Hibernate: remove watcher + shell hook"
+contexts = ["workspace"]
+command = ["./herdr-hibernate", "uninstall"]

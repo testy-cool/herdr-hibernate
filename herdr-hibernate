@@ -1,0 +1,1213 @@
+#!/usr/bin/env python3
+"""herdr-hibernate — auto-hibernate idle Claude Code tabs in Herdr.
+
+Kills the claude process tree of idle panes (freeing 650-930 MB each) and
+replaces it with a tiny bash stub that resumes the exact session on Enter.
+Panes and tabs are never closed. Dry-run by default.
+
+Hibernation survives reboots: each hibernated pane gets a stub script under
+~/.config/herdr-hibernate/panes/. A .bashrc hook re-arms that stub the moment
+Herdr spawns a fresh shell in the pane, and `restore` re-arms any pane whose
+stub died (Herdr restart, machine reboot, stub killed).
+
+Nothing is retained for a closed tab: when a pane disappears its record and
+stub script are deleted outright (after a short grace window), and the log is
+size-capped. The tool only ever holds data for panes that currently exist.
+
+Subcommands: watch | scan | restore | hibernate <pane_id> | forget <pane_id>
+              status | install | uninstall
+"""
+
+import calendar
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG_DIR = os.path.expanduser("~/.config/herdr-hibernate")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+LOG_FILE = os.path.join(CONFIG_DIR, "hibernate.log")
+STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
+PANES_DIR = os.path.join(CONFIG_DIR, "panes")
+PID_FILE = os.path.join(CONFIG_DIR, "watch.pid")
+TRANSCRIPT_GLOB = os.path.expanduser("~/.claude/projects/*/{uuid}.jsonl")
+SYSTEMD_UNIT = os.path.expanduser("~/.config/systemd/user/herdr-hibernate.service")
+SELF = os.path.abspath(__file__)
+SHELL_HOOK_MARK = "# >>> herdr-hibernate pane stub hook >>>"
+
+# (key, default, comment) — drives both the generated config file and the
+# in-memory defaults, and lets load_config() append keys added by an upgrade.
+CONFIG_KEYS = [
+    ("HIBERNATE_AFTER_MINUTES", "30",
+     "Hibernate a claude pane after this many minutes without transcript writes."),
+    ("SCAN_INTERVAL_SECONDS", "120",
+     "Seconds between scans in `watch` mode."),
+    ("PIN_MARKER", "📌",
+     "Any tab or pane whose label contains this marker is never hibernated.\n"
+     "This survives Herdr restarts (tab ids do not) — prefer it for durable pins."),
+    ("PINNED_TABS", '""',
+     "Space-separated tab ids that are never hibernated. NOTE: tab ids can change\n"
+     "across Herdr restarts; use the PIN_MARKER in the label for durable pinning."),
+    ("DRY_RUN", "1",
+     "1 = only log what WOULD happen. Set to 0 only after reviewing hibernate.log."),
+    ("KILL_GRACE_SECONDS", "5",
+     "Seconds to wait after SIGTERM before SIGKILL-ing survivors."),
+    ("FORGET_AFTER_MINUTES", "15",
+     "A closed tab is forgotten completely — record and stub script deleted.\n"
+     "This is the grace period first: a pane must be missing this long before\n"
+     "its data is erased, so a half-started Herdr cannot wipe live tabs.\n"
+     "Set 0 to forget the moment a pane is seen missing."),
+    ("LOG_MAX_KB", "512",
+     "Rotate hibernate.log past this size (one .1 backup is kept, so the log\n"
+     "never holds more than twice this). Old lines about closed tabs age out."),
+]
+
+DEFAULT_CONFIG = "# herdr-hibernate configuration (KEY=VALUE, bash-sourceable)\n" + "".join(
+    "\n%s\n%s=%s\n" % ("".join("# %s\n" % c for c in comment.split("\n")), key, val)
+    for key, val, comment in CONFIG_KEYS)
+
+DEFAULTS = {key: val.strip('"') for key, val, _ in CONFIG_KEYS}
+DEFAULTS["PINNED_TABS"] = ""
+
+
+# ---------------------------------------------------------------- utilities
+
+_log_max_bytes = 512 * 1024  # updated from LOG_MAX_KB by load_config()
+
+
+def rotate_log():
+    """Keep the log bounded: one rotation, so it never exceeds 2x the limit."""
+    if _log_max_bytes <= 0:
+        return
+    try:
+        if os.path.getsize(LOG_FILE) > _log_max_bytes:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+    except OSError:
+        pass
+
+
+def log(msg, echo=True):
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    rotate_log()
+    with open(LOG_FILE, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    if echo:
+        print(line, flush=True)
+
+
+def load_config():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            fh.write(DEFAULT_CONFIG)
+        log("created default config at %s (DRY_RUN=1)" % CONFIG_FILE)
+    cfg = dict(DEFAULTS)
+    with open(CONFIG_FILE, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                val = val[1:-1]
+            cfg[key] = val
+
+    # An upgrade can add keys; append the missing ones (with their comments) so
+    # the file stays a complete, editable record of what is tunable.
+    with open(CONFIG_FILE, encoding="utf-8") as fh:
+        body = fh.read()
+    missing = ["\n%s%s=%s\n" % ("".join("# %s\n" % c for c in comment.split("\n")),
+                                key, val)
+               for key, val, comment in CONFIG_KEYS
+               if not re.search(r"^\s*%s\s*=" % re.escape(key), body, re.M)]
+    if missing:
+        with open(CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("".join(missing))
+
+    global _log_max_bytes
+    try:
+        _log_max_bytes = int(float(cfg["LOG_MAX_KB"]) * 1024)
+    except (ValueError, KeyError):
+        pass
+    return cfg
+
+
+_herdr_bin = None
+
+
+def herdr_bin():
+    """Absolute path to the herdr CLI.
+
+    A `type = "shell"` keybinding is spawned by the Herdr server with a bare
+    PATH that need not include ~/.local/bin, so relying on PATH makes the tool
+    die with FileNotFoundError where nobody can see it.
+    """
+    global _herdr_bin
+    if _herdr_bin:
+        return _herdr_bin
+    injected = os.environ.get("HERDR_BIN_PATH")
+    if injected and os.access(injected, os.X_OK):
+        _herdr_bin = injected
+        return _herdr_bin
+    found = shutil.which("herdr")
+    if not found:
+        for cand in ("~/.local/bin/herdr", "/usr/local/bin/herdr",
+                     "/usr/bin/herdr", "/opt/herdr/bin/herdr"):
+            cand = os.path.expanduser(cand)
+            if os.access(cand, os.X_OK):
+                found = cand
+                break
+    _herdr_bin = found or "herdr"
+    return _herdr_bin
+
+
+def herdr(*args):
+    """Run a herdr CLI command, return the parsed `result` object."""
+    try:
+        out = subprocess.run(
+            [herdr_bin(), *args], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("cannot run herdr (%s): %s" % (herdr_bin(), exc))
+    if out.returncode != 0:
+        raise RuntimeError("herdr %s failed: %s" % (" ".join(args), out.stderr.strip()))
+    try:
+        return json.loads(out.stdout)["result"]
+    except (ValueError, KeyError):
+        # Some commands (e.g. `pane run`) print nothing / non-JSON on success.
+        return {}
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+
+
+TS_RE = re.compile(rb'"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)')
+TAIL_BYTES = 2 * 1024 * 1024
+
+
+def last_entry_epoch(path):
+    """Epoch of the newest timestamped entry in a transcript, or None.
+
+    The file's mtime is NOT a usable idle signal: Claude Code keeps rewriting
+    bookkeeping lines (e.g. `last-prompt`, which carries no timestamp) long
+    after the conversation goes quiet, so a 3-day-old session can show an mtime
+    of seconds ago. Only entries that carry their own timestamp mark real
+    activity, so read those.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > TAIL_BYTES:
+                fh.seek(size - TAIL_BYTES)
+            chunk = fh.read()
+            stamps = TS_RE.findall(chunk)
+            if not stamps and size > TAIL_BYTES:  # rare: no stamps in the tail
+                fh.seek(0)
+                stamps = TS_RE.findall(fh.read())
+    except OSError:
+        return None
+    if not stamps:
+        return None
+    # Timestamps are UTC ("...Z"); ISO-8601 strings sort chronologically.
+    newest = max(stamps).decode("ascii", "ignore")
+    try:
+        return calendar.timegm(time.strptime(newest, "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def transcript_age_minutes(uuid):
+    """Minutes since this session's last real activity, or None if no transcript."""
+    newest = None
+    for path in glob.glob(TRANSCRIPT_GLOB.format(uuid=uuid)):
+        stamp = last_entry_epoch(path)
+        if stamp is None:  # unreadable/unstamped — fall back to the file clock
+            try:
+                stamp = os.stat(path).st_mtime
+            except OSError:
+                continue
+        if newest is None or stamp > newest:
+            newest = stamp
+    if newest is None:
+        return None
+    return max(0.0, (time.time() - newest) / 60.0)
+
+
+def ps_snapshot():
+    """{pid: (ppid, rss_kb, args)} for all processes."""
+    out = subprocess.run(
+        ["ps", "-eo", "pid=,ppid=,rss=,args="], capture_output=True, text=True
+    ).stdout
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            procs[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3])
+        except ValueError:
+            continue
+    return procs
+
+
+def proc_uptime_minutes(pid):
+    """Minutes since a process started, or None if it cannot be read."""
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as fh:
+            fields = fh.read().rpartition(b")")[2].split()
+        starttime_ticks = int(fields[19])  # field 22, 1-based, after comm
+        with open("/proc/uptime") as fh:
+            uptime = float(fh.read().split()[0])
+    except (OSError, IndexError, ValueError):
+        return None
+    ticks = os.sysconf("SC_CLK_TCK") or 100
+    return max(0.0, (uptime - starttime_ticks / ticks) / 60.0)
+
+
+def descendants(root, procs):
+    kids = {}
+    for pid, (ppid, _, _) in procs.items():
+        kids.setdefault(ppid, []).append(pid)
+    result, stack = [], [root]
+    while stack:
+        pid = stack.pop()
+        for child in kids.get(pid, []):
+            result.append(child)
+            stack.append(child)
+    return result
+
+
+def tree_rss_mb(root, procs):
+    pids = [root] + descendants(root, procs)
+    return sum(procs[p][1] for p in pids if p in procs) // 1024
+
+
+def own_ancestors():
+    """PIDs of this process and all its ancestors (never kill these)."""
+    procs = ps_snapshot()
+    out, pid = set(), os.getpid()
+    while pid and pid in procs:
+        out.add(pid)
+        pid = procs[pid][0]
+    return out
+
+
+def fmt_idle(minutes):
+    if minutes is None:
+        return "?"
+    minutes = int(minutes)
+    if minutes < 60:
+        return "%dm" % minutes
+    hours, mins = divmod(minutes, 60)
+    if hours < 48:
+        return "%dh%02dm" % (hours, mins)
+    return "%dd%02dh" % divmod(hours, 24)
+
+
+# ------------------------------------------------------------- herdr state
+
+def collect_panes():
+    """All panes across all workspaces + tab label map."""
+    panes, tab_labels = [], {}
+    for ws in herdr("workspace", "list")["workspaces"]:
+        ws_id = ws["workspace_id"]
+        for tab in herdr("tab", "list", "--workspace", ws_id)["tabs"]:
+            tab_labels[tab["tab_id"]] = tab.get("label", "")
+        panes.extend(herdr("pane", "list", "--workspace", ws_id)["panes"])
+    return panes, tab_labels
+
+
+def session_uuid(pane):
+    sess = pane.get("agent_session")
+    if isinstance(sess, dict):
+        return sess.get("value")
+    return None
+
+
+def find_claude_proc(pane_id, uuid):
+    """The root claude process of a pane, from herdr's process info.
+
+    Returns (pid, cmdline) or (None, reason).
+    """
+    info = herdr("pane", "process-info", "--pane", pane_id)["process_info"]
+    procs = info.get("foreground_processes") or []
+    claudes = [
+        p for p in procs
+        if p.get("name") == "claude"
+        or (p.get("argv") and os.path.basename(p["argv"][0]) == "claude")
+    ]
+    # Ignore claude helper processes that are not an interactive session.
+    claudes = [
+        p for p in claudes
+        if not any(tok in p.get("cmdline", "")
+                   for tok in ("bg-pty-host", "bg-spare", " daemon "))
+    ]
+    if not claudes:
+        return None, "no claude process in pane foreground"
+    if uuid:
+        matched = [p for p in claudes if uuid in p.get("cmdline", "")]
+        if matched:
+            claudes = matched
+        else:
+            # A bare `claude` (no --resume) carries no uuid in args; accept it
+            # only if it names no OTHER session uuid.
+            for p in claudes:
+                other = re.search(r"--resume\s+([0-9a-f-]{36})", p.get("cmdline", ""))
+                if other and other.group(1) != uuid:
+                    return None, "pane claude runs a different session (%s)" % other.group(1)
+    if len(claudes) > 1:
+        return None, "multiple claude processes in pane; refusing to guess"
+    return claudes[0]["pid"], claudes[0].get("cmdline", "")
+
+
+# ------------------------------------------------------------ classification
+
+def classify(pane, tab_labels, cfg, state, self_pane):
+    """-> (decision, reason). decision: hibernate | exempt | skip"""
+    pane_id = pane["pane_id"]
+    tab_id = pane.get("tab_id", "")
+    label = tab_labels.get(tab_id, "") or pane.get("label", "")
+
+    if pane_id in state:
+        return "skip", "hibernated (stub waiting for Enter)"
+    if pane_id == self_pane:
+        return "exempt", "reaper's own pane"
+    agent = pane.get("agent")
+    if not agent:
+        return "skip", "no agent in pane"
+    if agent != "claude":
+        return "exempt", "non-claude agent (%s); v1 is Claude-only" % agent
+
+    status = pane.get("agent_status", "unknown")
+    if status in ("working", "blocked"):
+        return "exempt", "status %s" % status
+
+    pinned_tabs = cfg["PINNED_TABS"].split()
+    marker = cfg["PIN_MARKER"]
+    if tab_id in pinned_tabs:
+        return "exempt", "pinned via PINNED_TABS"
+    if marker and (marker in (tab_labels.get(tab_id, "") or "")
+                   or marker in (pane.get("label") or "")):
+        return "exempt", "pinned via %s label marker" % marker
+
+    if status not in ("idle", "done"):
+        return "skip", "status %s (need idle/done)" % status
+
+    uuid = session_uuid(pane)
+    if not uuid:
+        return "skip", "no session uuid — could not resume, never killing"
+
+    age = transcript_age_minutes(uuid)
+    if age is None:
+        return "skip", "no transcript file found for %s — cannot verify/resume" % uuid
+    threshold = float(cfg["HIBERNATE_AFTER_MINUTES"])
+    if age < threshold:
+        return "skip", "idle only %s (< %sm threshold)" % (fmt_idle(age), int(threshold))
+
+    return "hibernate", "idle %s" % fmt_idle(age)
+
+
+# -------------------------------------------------------------- hibernation
+
+def kill_tree(root, grace_seconds, protected):
+    """SIGTERM the whole tree rooted at `root`, SIGKILL survivors."""
+    procs = ps_snapshot()
+    if root not in procs:
+        return False, "process %d already gone" % root
+    if root in protected or root == 1:
+        return False, "refusing to kill protected pid %d" % root
+    if "claude" not in procs[root][2]:
+        return False, "pid %d is not a claude process (%s)" % (root, procs[root][2][:60])
+    targets = [root] + descendants(root, procs)
+    if protected & set(targets):
+        return False, "own process inside kill tree; aborting"
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline:
+        if not any(os.path.exists("/proc/%d" % p) for p in targets):
+            break
+        time.sleep(0.25)
+    for pid in targets:
+        if os.path.exists("/proc/%d" % pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    return True, "%d processes" % len(targets)
+
+
+STUB_TEMPLATE = """\
+#!/usr/bin/env bash
+# herdr-hibernate stub for pane {pane_id} — session {uuid}
+# Auto-generated. Deleting this file only disables auto-resume for that pane.
+shopt -s execfail
+# This script must always run as a CHILD of the pane's shell, never replace it
+# (no `exec bash <this>`). claude then ends up a child too, so killing claude at
+# the next hibernation leaves the pane's shell alive. If claude were the pane
+# shell itself, killing it would close the whole tab.
+_hb_bye() {{
+    printf '\\n\\033[1;31m%s\\033[0m\\n' 'hibernation stub dismissed.'
+    printf 'resume this session by hand with:  claude --resume %s\\n\\n' {uuid}
+    exit 0
+}}
+trap _hb_bye INT
+_hb_stub() {{
+    export HERDR_HIBERNATE_STUB=1
+    cd {cwd} 2>/dev/null || cd "$HOME" || return 0
+    printf '\\n\\033[1;35m%s\\033[0m\\n' {banner}
+    printf '\\033[2m%s\\033[0m\\n\\n' {subtitle}
+    IFS= read -r _ || return 0
+    printf 'resuming session %s (takes 10-20s)...\\n' {uuid}
+    {herdr} tab rename {tab_id} {label} >/dev/null 2>&1
+    # NOTE: the record and this script are deliberately NOT deleted here. The
+    # reaper clears them once it sees claude actually live in the pane, so a
+    # failed resume (or a Herdr restart mid-resume) still leaves the pane armed.
+    exec claude --resume {uuid}
+}}
+_hb_stub
+_hb_bye
+"""
+
+
+def pane_file(pane_id):
+    """Path of the durable stub script for a pane (must match the .bashrc hook)."""
+    return os.path.join(PANES_DIR, re.sub(r"[^A-Za-z0-9]", "_", pane_id) + ".sh")
+
+
+def since_minutes(at):
+    """Minutes since a 'YYYY-mm-dd HH:MM:SS' timestamp, or None if unparseable."""
+    try:
+        return (time.time() - time.mktime(
+            time.strptime(at, "%Y-%m-%d %H:%M:%S"))) / 60.0
+    except (ValueError, TypeError):
+        return None
+
+
+def since_str(at):
+    """Human age of a 'YYYY-mm-dd HH:MM:SS' timestamp."""
+    mins = since_minutes(at)
+    return "?" if mins is None else fmt_idle(mins)
+
+
+def write_stub_file(pane_id, rec):
+    """(Re)write the pane's stub script from its state record. Returns its path."""
+    os.makedirs(PANES_DIR, exist_ok=True)
+    banner = "💤 hibernated %s ago (freed ~%dMB) — press Enter to resume" % (
+        since_str(rec.get("at", "")), rec.get("freed_mb", 0))
+    subtitle = "session %s · %s · Ctrl-C for a plain shell" % (
+        rec["uuid"], rec.get("cwd", ""))
+    path = pane_file(pane_id)
+    body = STUB_TEMPLATE.format(
+        pane_id=shlex.quote(pane_id),
+        uuid=shlex.quote(rec["uuid"]),
+        cwd=shlex.quote(rec.get("cwd") or os.path.expanduser("~")),
+        tab_id=shlex.quote(rec.get("tab_id", "")),
+        label=shlex.quote(rec.get("label", "")),
+        banner=shlex.quote(banner),
+        subtitle=shlex.quote(subtitle),
+        tool=shlex.quote(SELF),
+        herdr=shlex.quote(herdr_bin()),
+    )
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+    return path
+
+
+def remove_stub_file(pane_id):
+    try:
+        os.remove(pane_file(pane_id))
+    except OSError:
+        pass
+
+
+def stub_command(pane_id):
+    """Command that arms the pane's stub as a CHILD of the pane shell.
+
+    Never `exec` here: the pane's own shell has to outlive both the stub and
+    the claude it resumes, otherwise the next hibernation closes the tab.
+    """
+    return "bash %s" % shlex.quote(pane_file(pane_id))
+
+
+def pane_process_info(pane_id):
+    try:
+        return herdr("pane", "process-info", "--pane", pane_id)["process_info"]
+    except (RuntimeError, KeyError, TypeError):
+        return None
+
+
+# "hibernate-stub" is the arg0 of stubs planted by versions before stub files
+# existed; those are still valid waiting stubs and must not be double-planted.
+STUB_MARKERS = (PANES_DIR, "hibernate-stub")
+
+
+def stub_alive(info):
+    """True if this pane's foreground process is a herdr-hibernate stub."""
+    if not info:
+        return False
+    return any(any(m in (p.get("cmdline") or "") for m in STUB_MARKERS)
+               for p in info.get("foreground_processes") or [])
+
+
+def bare_shell(info):
+    """True if the pane sits at an idle shell prompt with nothing running.
+
+    Deliberately strict: the single foreground process must be the shell itself
+    with no arguments, so a pane running `bash -c ...` is never mistaken for an
+    empty prompt and never has a stub typed into it.
+    """
+    if not info:
+        return False
+    procs = info.get("foreground_processes") or []
+    if len(procs) != 1:
+        return False
+    proc = procs[0]
+    if proc.get("name") not in ("bash", "sh", "zsh", "fish", "dash"):
+        return False
+    argv = proc.get("argv") or []
+    return len(argv) <= 1 and proc.get("pid") == info.get("shell_pid")
+
+
+def toast(title, body="", sound="none"):
+    """Best-effort Herdr notification — the only feedback a keybinding can give."""
+    args = ["notification", "show", title, "--position", "top-right",
+            "--sound", sound]
+    if body:
+        args += ["--body", body]
+    try:
+        herdr(*args)
+    except (RuntimeError, OSError):
+        pass
+
+
+def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False):
+    pane_id = pane["pane_id"]
+    tab_id = pane.get("tab_id", "")
+    label = tab_labels.get(tab_id, "") or pane.get("label", "") or pane_id
+    uuid = session_uuid(pane)
+
+    pid, cmdline = find_claude_proc(pane_id, uuid)
+    if pid is None:
+        log("SKIP %s (%s): %s" % (label, pane_id, cmdline))
+        return False
+
+    # Killing the pane's own shell closes the tab. That is never acceptable —
+    # it can happen if claude replaced the shell (an `exec claude` stub).
+    info = pane_process_info(pane_id)
+    if info and pid == info.get("shell_pid"):
+        log("SKIP %s (%s): claude is the pane's shell — killing it would close "
+            "the tab" % (label, pane_id))
+        return False
+
+    # A session resumed a moment ago still has an old last-message timestamp
+    # (loading history writes nothing), so it looks ancient. It cannot be idler
+    # than its own process is old.
+    up = proc_uptime_minutes(pid)
+    threshold = float(cfg["HIBERNATE_AFTER_MINUTES"])
+    if not force and up is not None and up < threshold:
+        log("SKIP %s (%s): claude only started %s ago (likely just resumed)" % (
+            label, pane_id, fmt_idle(up)))
+        return False
+
+    rss_mb = tree_rss_mb(pid, ps_snapshot())
+
+    if dry_run:
+        log("WOULD hibernate %s (%s, idle %s, ~%dMB, pid %d)" % (
+            label, pane_id, idle_str, rss_mb, pid))
+        return False
+
+    # Re-verify status just before killing — it may have started working.
+    fresh = herdr("pane", "get", pane_id).get("pane", {})
+    if fresh.get("agent_status") not in ("idle", "done"):
+        log("ABORT %s (%s): status changed to %s" % (
+            label, pane_id, fresh.get("agent_status")))
+        return False
+
+    ok, detail = kill_tree(pid, float(cfg["KILL_GRACE_SECONDS"]), own_ancestors())
+    if not ok:
+        log("ABORT %s (%s): %s" % (label, pane_id, detail))
+        return False
+
+    time.sleep(1.0)  # let the pane shell come back to its prompt
+    cwd = pane.get("cwd") or os.path.expanduser("~")
+    rec = {
+        "uuid": uuid, "tab_id": tab_id, "label": label, "cwd": cwd,
+        "freed_mb": rss_mb, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    # Record + stub file first: if anything below fails, the .bashrc hook and
+    # `restore` can still bring this pane back.
+    state[pane_id] = rec
+    save_state(state)
+    write_stub_file(pane_id, rec)
+    herdr("pane", "run", pane_id, stub_command(pane_id))
+    try:
+        if label and not label.startswith("💤"):
+            herdr("tab", "rename", tab_id, "💤 %s" % label)
+    except RuntimeError:
+        pass
+    log("HIBERNATED %s (%s, idle %s, freed ~%dMB, killed tree of pid %d [%s])" % (
+        label, pane_id, idle_str, rss_mb, pid, detail))
+    return True
+
+
+def forget_record(pane_id, state, why):
+    """Erase everything this tool knows about a pane. Nothing is archived.
+
+    Deliberately no graveyard file: once a tab is gone, its session id, label
+    and cwd leave the tool entirely. The transcript itself is Claude Code's
+    own data under ~/.claude/projects and is never touched here.
+    """
+    rec = state.pop(pane_id, None)
+    save_state(state)
+    remove_stub_file(pane_id)
+    log("FORGOT %s (%s): %s" % (rec.get("label", "?") if rec else "?",
+                                pane_id, why))
+
+
+def gc_stub_files(state):
+    """Delete stub scripts that no longer belong to a tracked pane."""
+    expected = {os.path.basename(pane_file(p)) for p in state}
+    try:
+        names = os.listdir(PANES_DIR)
+    except OSError:
+        return
+    for name in names:
+        if name.endswith(".sh") and name not in expected:
+            try:
+                os.remove(os.path.join(PANES_DIR, name))
+                log("GC stub script %s (no matching pane record)" % name,
+                    echo=False)
+            except OSError:
+                pass
+
+
+def match_pane(pane_id, rec, panes):
+    """Find the pane a record belongs to, tolerating id churn across restarts."""
+    by_id = {p["pane_id"]: p for p in panes}
+    if pane_id in by_id:
+        return by_id[pane_id]
+    # Herdr can renumber panes across restarts: fall back to the tab, then to
+    # the tab label we stamped with 💤 plus the recorded cwd.
+    for pane in panes:
+        if rec.get("tab_id") and pane.get("tab_id") == rec["tab_id"]:
+            return pane
+    for pane in panes:
+        if (not pane.get("agent") and rec.get("cwd")
+                and pane.get("cwd") == rec["cwd"]
+                and (pane.get("label") or "").lstrip("💤 ") == rec.get("label")):
+            return pane
+    return None
+
+
+def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
+    """Re-arm hibernated panes whose stub died (Herdr restart / reboot / kill).
+
+    This is what makes hibernation survive a machine restart: the stub is just
+    a process, so it dies with Herdr — but the state record and the pane's stub
+    script both live on disk, so the pane can always be re-armed.
+    """
+    restored = 0
+    for pane_id in list(state):
+        rec = state[pane_id]
+        label = rec.get("label", "?")
+        pane = match_pane(pane_id, rec, panes)
+        if pane is None:
+            # Tab closed -> forget it completely. The grace window exists only
+            # so a half-started Herdr (incomplete pane list) cannot erase tabs
+            # that are actually still open.
+            gone_for = since_minutes(rec.get("missing_since"))
+            if dry_run:
+                log("WOULD forget %s (%s): pane gone%s" % (
+                    label, pane_id,
+                    "" if gone_for is None else " for %s" % fmt_idle(gone_for)))
+            elif forget_after <= 0 or (gone_for is not None
+                                       and gone_for >= forget_after):
+                forget_record(pane_id, state, "tab closed")
+            elif gone_for is None:
+                rec["missing_since"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                save_state(state)
+                log("MISSING %s (%s): pane gone — forgetting in %dm unless it "
+                    "comes back" % (label, pane_id, forget_after), echo=False)
+            continue
+        if rec.pop("missing_since", None) is not None:
+            save_state(state)  # pane came back — cancel the pending forget
+        if transcript_age_minutes(rec["uuid"]) is None:
+            # No transcript means nothing to resume — the record is dead weight.
+            if not dry_run:
+                forget_record(pane_id, state, "session transcript is gone")
+            continue
+
+        live_id = pane["pane_id"]
+        if live_id != pane_id and not dry_run:  # pane renumbered — re-key it
+            log("REKEY %s: %s -> %s" % (label, pane_id, live_id))
+            remove_stub_file(pane_id)
+            del state[pane_id]
+            rec["tab_id"] = pane.get("tab_id", rec.get("tab_id", ""))
+            state[live_id] = rec
+            save_state(state)
+            pane_id = live_id
+
+        info = pane_process_info(pane_id)
+        if stub_alive(info):
+            # Healthy: a stub is sitting there waiting for Enter. Still make
+            # sure its script exists on disk, so the .bashrc hook can re-arm
+            # the pane by itself after the next reboot.
+            # Rewriting is safe while the stub runs: write_stub_file replaces
+            # the file atomically, so the running bash keeps its old inode.
+            if not dry_run:
+                fresh = not os.path.exists(pane_file(pane_id))
+                write_stub_file(pane_id, rec)
+                if fresh:
+                    log("ARMED %s (%s): wrote stub script for reboot recovery"
+                        % (label, pane_id), echo=False)
+            continue
+        if pane.get("agent") == "claude":
+            # Claude is live in the pane again — the stub did its job. (Accept
+            # any session uuid: right after a resume Herdr may not have picked
+            # the session identity up yet.)
+            if not dry_run:
+                log("RESUMED %s (%s)" % (label, pane_id), echo=False)
+                del state[pane_id]
+                remove_stub_file(pane_id)
+                save_state(state)
+            continue
+        if pane.get("agent"):
+            if not dry_run:
+                forget_record(pane_id, state,
+                              "pane reused by agent %s" % pane.get("agent"))
+            continue
+        if not bare_shell(info):
+            log("SKIP restore %s (%s): pane is busy, will retry next pass" % (
+                label, pane_id))
+            continue
+
+        # Pane is an empty shell but we still owe it a session: re-arm it.
+        if dry_run:
+            log("WOULD restore %s (%s): stub is dead, session %s" % (
+                label, pane_id, rec["uuid"]))
+            continue
+        write_stub_file(pane_id, rec)
+        try:
+            herdr("pane", "run", pane_id, stub_command(pane_id))
+        except RuntimeError as exc:  # pane vanished mid-sweep; try again later
+            log("SKIP restore %s (%s): %s" % (label, pane_id, exc))
+            continue
+        tab_id = pane.get("tab_id", rec.get("tab_id", ""))
+        cur_label = tab_labels.get(tab_id, "")
+        if tab_id and label and not cur_label.startswith("💤"):
+            try:
+                herdr("tab", "rename", tab_id, "💤 %s" % label)
+            except RuntimeError:
+                pass
+        restored += 1
+        log("RESTORED %s (%s): re-armed stub for session %s" % (
+            label, pane_id, rec["uuid"]))
+    if not dry_run:
+        gc_stub_files(state)
+    return restored
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_scan(cfg=None):
+    cfg = cfg or load_config()
+    dry_run = cfg["DRY_RUN"] != "0"
+    self_pane = os.environ.get("HERDR_PANE_ID", "")
+    state = load_state()
+    panes, tab_labels = collect_panes()
+    # Always first: a dead stub (Herdr restart / reboot) must be re-armed before
+    # anything else looks at this pane. Restore is never gated by DRY_RUN — it
+    # only ever hands panes back the session they already lost.
+    restore_records(panes, tab_labels, state,
+                    forget_after=float(cfg["FORGET_AFTER_MINUTES"]))
+
+    mode = "DRY-RUN" if dry_run else "LIVE"
+    log("--- scan (%s, threshold %sm, %d panes) ---" % (
+        mode, cfg["HIBERNATE_AFTER_MINUTES"], len(panes)))
+    count = 0
+    for pane in panes:
+        decision, reason = classify(pane, tab_labels, cfg, state, self_pane)
+        pane_id = pane["pane_id"]
+        label = tab_labels.get(pane.get("tab_id", ""), "") or pane.get("label", "") or "(unnamed)"
+        if decision == "hibernate":
+            # One pane must never abort the pass: a tab closed mid-scan makes
+            # the herdr call fail, and the remaining panes still need a look.
+            try:
+                hibernate_pane(pane, tab_labels, cfg, state,
+                               reason.replace("idle ", ""), dry_run)
+            except Exception as exc:
+                log("ERROR hibernating %s (%s): %s" % (label, pane_id, exc))
+            count += 1
+        elif decision == "exempt":
+            log("exempt %s (%s): %s" % (label, pane_id, reason))
+        else:
+            log("skip   %s (%s): %s" % (label, pane_id, reason))
+    log("--- scan done: %d candidate(s)%s ---" % (
+        count, " (dry-run, nothing touched)" if dry_run and count else ""))
+
+
+def cmd_watch():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    old = watcher_pid()
+    if old and old != os.getpid():
+        sys.exit("watch already running (pid %d); use uninstall to stop it" % old)
+    with open(PID_FILE, "w") as fh:
+        fh.write(str(os.getpid()))
+    log("watch started (pid %d)" % os.getpid())
+    try:  # a fresh watcher usually means a fresh Herdr: re-arm dead stubs now
+        state = load_state()
+        if state:
+            panes, tab_labels = collect_panes()
+            restore_records(panes, tab_labels, state,
+                            forget_after=float(load_config()["FORGET_AFTER_MINUTES"]))
+    except Exception as exc:
+        log("startup restore failed: %s" % exc)
+    try:
+        while True:
+            cfg = load_config()  # re-read each pass so DRY_RUN flips take effect
+            try:
+                cmd_scan(cfg)
+            except Exception as exc:  # keep the loop alive
+                log("scan error: %s" % exc)
+            time.sleep(float(cfg["SCAN_INTERVAL_SECONDS"]))
+    finally:
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+
+
+def cmd_now():
+    """Hibernate the focused pane right now — what a keybinding calls.
+
+    Runs detached from any pane, so it asks Herdr which pane has focus rather
+    than trusting HERDR_PANE_ID. Feedback goes to a Herdr notification, since a
+    detached command has nowhere to print.
+    """
+    log("now: on-demand hibernate requested (PATH=%s)"
+        % os.environ.get("PATH", "")[:80], echo=False)
+    try:
+        pane = herdr("pane", "current").get("pane") or {}
+    except RuntimeError as exc:
+        toast("Hibernate failed", str(exc)[:120], sound="request")
+        sys.exit(1)
+    pane_id = pane.get("pane_id") or os.environ.get("HERDR_PANE_ID", "")
+    if not pane_id:
+        toast("Hibernate failed", "could not tell which pane has focus",
+              sound="request")
+        sys.exit(1)
+    cmd_hibernate(pane_id, force=True, notify=True)
+
+
+def cmd_hibernate(pane_id, force=False, notify=False):
+    """Manual hibernate: bypasses the idle-time threshold, keeps all safety rules.
+
+    `force` additionally skips the just-resumed guard (an explicit request is
+    not a mistake). The guard that refuses to kill a pane's own shell always
+    applies — that one would close the tab.
+    """
+    cfg = load_config()
+    dry_run = cfg["DRY_RUN"] != "0"
+
+    def fail(msg):
+        if notify:
+            toast("Not hibernated", msg[:160], sound="request")
+        sys.exit(msg)
+    state = load_state()
+    panes, tab_labels = collect_panes()
+    restore_records(panes, tab_labels, state,
+                    forget_after=float(cfg["FORGET_AFTER_MINUTES"]))
+    pane = next((p for p in panes if p["pane_id"] == pane_id), None)
+    if pane is None:
+        fail("no such pane: %s" % pane_id)
+    # A key press is aimed at whatever is focused, so never treat the focused
+    # pane as "the reaper's own" — that exemption exists for the watcher only.
+    self_pane = "" if force else os.environ.get("HERDR_PANE_ID", "")
+    decision, reason = classify(pane, tab_labels, cfg, state, self_pane)
+    if decision == "exempt":
+        fail("refusing: %s" % reason)
+    if decision == "skip" and not reason.startswith("idle only"):
+        fail("cannot hibernate: %s" % reason)
+    uuid = session_uuid(pane)
+    idle = fmt_idle(transcript_age_minutes(uuid))
+    before = len(state)
+    hibernate_pane(pane, tab_labels, cfg, state, idle, dry_run, force=force)
+    if dry_run:
+        print("(dry-run — set DRY_RUN=0 in %s to hibernate for real)" % CONFIG_FILE)
+    elif notify and len(state) == before:
+        # hibernate_pane logged the reason and returned without acting.
+        fail("hibernate refused — see %s" % LOG_FILE)
+
+
+def cmd_restore(dry_run=False):
+    """Re-arm every hibernated pane whose stub is gone. Safe to run any time."""
+    state = load_state()
+    if not state:
+        print("nothing hibernated")
+        return
+    panes, tab_labels = collect_panes()
+    n = restore_records(panes, tab_labels, state, dry_run=dry_run,
+                        forget_after=float(load_config()["FORGET_AFTER_MINUTES"]))
+    print("restore: %d pane(s) re-armed, %d hibernated record(s) tracked" % (
+        n, len(load_state())))
+
+
+def cmd_forget(pane_id, resumed=False):
+    """Drop a pane's hibernation record and stub (called by the stub on resume)."""
+    state = load_state()
+    rec = state.pop(pane_id, None)
+    save_state(state)
+    remove_stub_file(pane_id)
+    if rec:
+        log("%s %s (%s)" % ("RESUMED" if resumed else "FORGOT",
+                            rec.get("label", "?"), pane_id), echo=not resumed)
+    elif not resumed:
+        print("no hibernation record for %s" % pane_id)
+
+
+SHELL_HOOK = """%s
+# Re-arm a hibernated Claude session when Herdr spawns a fresh shell in a pane.
+# This is what makes hibernation survive a reboot: the stub process dies with
+# Herdr, but its script lives on disk and this hook runs it again.
+# Run it as a CHILD (no exec) so this shell stays the pane's shell — claude is
+# then a grandchild, and killing it at the next hibernation cannot close the tab.
+if [ -n "${HERDR_PANE_ID:-}" ] && [ -z "${HERDR_HIBERNATE_STUB:-}" ] \\
+   && [[ $- == *i* ]]; then
+    _hb_stub_file="$HOME/.config/herdr-hibernate/panes/${HERDR_PANE_ID//[^A-Za-z0-9]/_}.sh"
+    if [ -s "$_hb_stub_file" ]; then
+        HERDR_HIBERNATE_STUB=1 bash "$_hb_stub_file"
+    fi
+    unset _hb_stub_file
+fi
+# <<< herdr-hibernate pane stub hook <<<
+""" % SHELL_HOOK_MARK
+
+
+def install_shell_hook(rc=os.path.expanduser("~/.bashrc")):
+    """Add (or refresh) the .bashrc hook that re-arms stubs in fresh shells."""
+    try:
+        with open(rc, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError:
+        body = ""
+    if SHELL_HOOK_MARK in body:
+        start = body.index(SHELL_HOOK_MARK)
+        end = body.index("# <<< herdr-hibernate pane stub hook <<<", start)
+        end = body.index("\n", end) + 1
+        if body[start:end] == SHELL_HOOK:
+            return "shell hook already installed in %s" % rc
+        body = body[:start] + SHELL_HOOK + body[end:]
+        action = "updated"
+    else:
+        body = body.rstrip("\n") + "\n\n" + SHELL_HOOK
+        action = "installed"
+    with open(rc, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return "%s shell hook in %s" % (action, rc)
+
+
+def cmd_status():
+    cfg = load_config()
+    state = load_state()
+    self_pane = os.environ.get("HERDR_PANE_ID", "")
+    panes, tab_labels = collect_panes()
+    restore_records(panes, tab_labels, state, dry_run=True)
+    threshold = cfg["HIBERNATE_AFTER_MINUTES"]
+    print("DRY_RUN=%s  threshold=%sm  pin_marker=%s  pinned_tabs=[%s]\n" % (
+        cfg["DRY_RUN"], threshold, cfg["PIN_MARKER"], cfg["PINNED_TABS"]))
+    fmt = "%-22s %-28s %-8s %-7s %s"
+    print(fmt % ("PANE", "TAB LABEL", "STATUS", "IDLE", "CLASSIFICATION"))
+    for pane in panes:
+        pane_id = pane["pane_id"]
+        label = (tab_labels.get(pane.get("tab_id", ""), "")
+                 or pane.get("label", "") or "(unnamed)")[:28]
+        status = pane.get("agent_status", "-") if pane.get("agent") else "-"
+        uuid = session_uuid(pane)
+        idle = fmt_idle(transcript_age_minutes(uuid)) if uuid else "-"
+        decision, reason = classify(pane, tab_labels, cfg, state, self_pane)
+        tag = {"hibernate": "WOULD HIBERNATE", "exempt": "EXEMPT — " + reason,
+               "skip": reason}[decision]
+        if decision == "hibernate":
+            # Show the guards hibernate_pane applies, so this table cannot
+            # promise a kill that would actually be refused.
+            try:
+                pid, _ = find_claude_proc(pane_id, uuid)
+            except RuntimeError:
+                pid = None
+            if pid:
+                info = pane_process_info(pane_id)
+                up = proc_uptime_minutes(pid)
+                if info and pid == info.get("shell_pid"):
+                    tag = "PROTECTED — claude is the pane's shell"
+                elif up is not None and up < float(threshold):
+                    tag = "PROTECTED — claude started %s ago" % fmt_idle(up)
+        print(fmt % (pane_id, label, status, idle, tag))
+    state = load_state()
+    if state:
+        print("\nhibernated:")
+        for pane_id, rec in state.items():
+            armed = "stub armed" if stub_alive(pane_process_info(pane_id)) \
+                else "STUB DEAD — run `herdr-hibernate restore`"
+            print("  %s  %-28s freed ~%dMB at %s  [%s]" % (
+                pane_id, rec["label"][:28], rec["freed_mb"], rec["at"], armed))
+
+
+def watcher_pid():
+    """PID of a live watcher, or None. Survives reboots reusing the pid."""
+    try:
+        pid = int(open(PID_FILE).read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            if b"herdr-hibernate" in fh.read():
+                return pid
+    except OSError:
+        pass
+    return None
+
+
+def cmd_ensure():
+    """Start the watcher if it is not already running (for shell rc hooks)."""
+    if watcher_pid():
+        return
+    subprocess.Popen(
+        [SELF, "watch"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True)
+    log("ensure: watcher was not running, started a new one", echo=False)
+
+
+def systemd_available():
+    try:
+        return subprocess.run(["systemctl", "--user", "status"],
+                              capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def cmd_install():
+    self_path = SELF
+    print(install_shell_hook())
+    if systemd_available():
+        os.makedirs(os.path.dirname(SYSTEMD_UNIT), exist_ok=True)
+        env_lines = "".join(
+            'Environment="%s=%s"\n' % (k, os.environ[k])
+            for k in ("HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID")
+            if k in os.environ)
+        with open(SYSTEMD_UNIT, "w") as fh:
+            fh.write("[Unit]\nDescription=herdr-hibernate idle-tab reaper\n\n"
+                     "[Service]\nExecStart=%s watch\nRestart=on-failure\n%s\n"
+                     "[Install]\nWantedBy=default.target\n" % (self_path, env_lines))
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now",
+                        "herdr-hibernate.service"], check=True)
+        print("installed systemd user service: herdr-hibernate.service")
+        return
+    # WSL2 fallback: detached nohup loop inheriting this pane's Herdr env.
+    old = watcher_pid()
+    if old:
+        sys.exit("already installed and running (pid %d)" % old)
+    proc = subprocess.Popen(
+        ["nohup", self_path, "watch"],
+        stdout=open(os.devnull, "w"), stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL, start_new_session=True)
+    print("systemd user units unavailable — started nohup watcher (pid %d)." % proc.pid)
+    print("It inherits this pane's Herdr env; re-run install after a Herdr restart.")
+    print("Log: %s" % LOG_FILE)
+
+
+def cmd_uninstall():
+    stopped = False
+    if os.path.exists(SYSTEMD_UNIT):
+        subprocess.run(["systemctl", "--user", "disable", "--now",
+                        "herdr-hibernate.service"], capture_output=True)
+        os.remove(SYSTEMD_UNIT)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        print("removed systemd user service")
+        stopped = True
+    if os.path.exists(PID_FILE):
+        try:
+            pid = int(open(PID_FILE).read().strip())
+            if os.path.exists("/proc/%d" % pid):
+                os.kill(pid, signal.SIGTERM)
+                print("stopped watcher (pid %d)" % pid)
+                stopped = True
+        except (ValueError, ProcessLookupError):
+            pass
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+    if not stopped:
+        print("nothing to uninstall")
+
+
+def main():
+    if os.environ.get("HERDR_ENV") != "1" and "HERDR_PANE_ID" not in os.environ:
+        # herdr CLI may still reach the session, but warn: self-pane exemption
+        # cannot work without HERDR_PANE_ID.
+        print("warning: not inside a Herdr-managed pane (HERDR_ENV != 1)",
+              file=sys.stderr)
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__.strip())
+        sys.exit(2)
+    cmd = args[0]
+    if cmd == "watch":
+        cmd_watch()
+    elif cmd == "scan":
+        cmd_scan()
+    elif cmd == "hibernate":
+        if len(args) < 2:
+            sys.exit("usage: herdr-hibernate hibernate <pane_id> [--force]")
+        cmd_hibernate(args[1], force="--force" in args)
+    elif cmd == "now":
+        cmd_now()
+    elif cmd == "restore":
+        cmd_restore(dry_run="--dry-run" in args)
+    elif cmd == "forget":
+        if len(args) < 2:
+            sys.exit("usage: herdr-hibernate forget <pane_id> [--resumed]")
+        cmd_forget(args[1], resumed="--resumed" in args)
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "ensure":
+        cmd_ensure()
+    elif cmd == "install":
+        cmd_install()
+    elif cmd == "uninstall":
+        cmd_uninstall()
+    else:
+        sys.exit("unknown command: %s\n%s" % (cmd, __doc__.strip()))
+
+
+if __name__ == "__main__":
+    main()
