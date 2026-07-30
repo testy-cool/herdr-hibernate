@@ -21,6 +21,8 @@ Subcommands: watch | scan | restore | hibernate <pane_id> | forget <pane_id>
 """
 
 import calendar
+import contextlib
+import fcntl
 import glob
 import json
 import os
@@ -38,6 +40,8 @@ LOG_FILE = os.path.join(CONFIG_DIR, "hibernate.log")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 PANES_DIR = os.path.join(CONFIG_DIR, "panes")
 PID_FILE = os.path.join(CONFIG_DIR, "watch.pid")
+WATCH_LOCK_FILE = os.path.join(CONFIG_DIR, "watch.lock")
+OPERATION_LOCK_FILE = os.path.join(CONFIG_DIR, "operation.lock")
 SYSTEMD_UNIT = os.path.expanduser("~/.config/systemd/user/herdr-hibernate.service")
 SELF = os.path.abspath(__file__)
 SHELL_HOOK_MARK = "# >>> herdr-hibernate pane stub hook >>>"
@@ -263,8 +267,50 @@ def load_state():
 
 def save_state(state):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, indent=2)
+    tmp = "%s.tmp.%d" % (STATE_FILE, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, STATE_FILE)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+@contextlib.contextmanager
+def file_lock(path, blocking=True):
+    """Hold an advisory process lock. Yield False when a nonblocking lock is busy."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fh = open(path, "a+")
+    flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+    try:
+        try:
+            fcntl.flock(fh.fileno(), flags)
+        except BlockingIOError:
+            fh.close()
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        if not fh.closed:
+            fh.close()
+
+
+def watcher_lock_active():
+    """True when another process holds the watcher singleton lock."""
+    with file_lock(WATCH_LOCK_FILE, blocking=False) as acquired:
+        return not acquired
+
+
+def run_locked(func, *args, **kwargs):
+    """Serialize every state-changing one-shot operation."""
+    with file_lock(OPERATION_LOCK_FILE):
+        return func(*args, **kwargs)
 
 
 TS_RE = re.compile(rb'"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)')
@@ -655,7 +701,7 @@ _hb_stub() {{
     printf '\\033[2m%s\\033[0m\\n\\n' {subtitle}
     IFS= read -r _ || return 0
     printf 'resuming session %s (takes 10-20s)...\\n' {uuid}
-    {herdr} tab rename {tab_id} {label} >/dev/null 2>&1
+    {tool} label-awake {pane_id} >/dev/null 2>&1
     # NOTE: the record and this script are deliberately NOT deleted here. The
     # reaper clears them once it sees the agent actually live in the pane, so a
     # failed resume (or a Herdr restart mid-resume) still leaves the pane armed.
@@ -722,12 +768,9 @@ def write_stub_file(pane_id, rec):
         resume_cmd=" ".join(shlex.quote(t) for t in resume),
         resume_display=shlex.quote(" ".join(shlex.quote(t) for t in resume)),
         cwd=shlex.quote(rec.get("cwd") or os.path.expanduser("~")),
-        tab_id=shlex.quote(rec.get("tab_id", "")),
-        label=shlex.quote(rec.get("label", "")),
         banner=shlex.quote(banner),
         subtitle=shlex.quote(subtitle),
         tool=shlex.quote(SELF),
-        herdr=shlex.quote(herdr_bin()),
     )
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -836,6 +879,62 @@ def build_resume(agent, sid, proc, cwd):
     return base + extra
 
 
+def record_marked_label(rec):
+    """The exact label this record owns, including backward compatibility."""
+    if rec.get("marker_added") is False:
+        return None
+    marked = rec.get("marked_label")
+    if marked:
+        return marked
+    label = rec.get("label", "")
+    if label and not label.startswith("💤"):
+        return "💤 %s" % label
+    return None
+
+
+def marker_record(label, tab_id, state):
+    """Return (original, marked, added) for a new hibernation record."""
+    for rec in state.values():
+        if rec.get("tab_id") != tab_id:
+            continue
+        marked = record_marked_label(rec)
+        if marked and label == marked:
+            return rec.get("label", label), marked, True
+    if label and not label.startswith("💤"):
+        return label, "💤 %s" % label, True
+    return label, None, False
+
+
+def restore_owned_tab_label(pane_id, pane, rec, state):
+    """Restore our exact tab marker. False means retry before deleting the record."""
+    marked = record_marked_label(rec)
+    if not marked:
+        return True
+    tab_id = pane.get("tab_id") or rec.get("tab_id", "")
+    if not tab_id:
+        return False
+    if any(other_id != pane_id
+           and other.get("tab_id") == tab_id
+           and record_marked_label(other) == marked
+           for other_id, other in state.items()):
+        return True  # another pane in this tab is still hibernated
+    try:
+        current = herdr("tab", "get", tab_id).get("tab", {}).get("label", "")
+    except RuntimeError as exc:
+        log("LABEL retry %s (%s): %s" % (rec.get("label", "?"), pane_id, exc),
+            echo=False)
+        return False
+    if current != marked:
+        return True  # the user changed it, or this marker is not ours
+    try:
+        herdr("tab", "rename", tab_id, rec.get("label", ""))
+    except RuntimeError as exc:
+        log("LABEL retry %s (%s): %s" % (rec.get("label", "?"), pane_id, exc),
+            echo=False)
+        return False
+    return True
+
+
 def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False):
     pane_id = pane["pane_id"]
     tab_id = pane.get("tab_id", "")
@@ -899,10 +998,12 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
 
     time.sleep(1.0)  # let the pane shell come back to its prompt
     cwd = pane.get("cwd") or os.path.expanduser("~")
+    original_label, marked_label, marker_added = marker_record(label, tab_id, state)
     rec = {
         "uuid": uuid, "agent": agent,
         "resume": build_resume(agent, uuid, proc, cwd),
-        "tab_id": tab_id, "label": label, "cwd": cwd,
+        "tab_id": tab_id, "label": original_label, "cwd": cwd,
+        "marker_added": marker_added, "marked_label": marked_label,
         "freed_mb": rss_mb, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     # Record + stub file first: if anything below fails, the .bashrc hook and
@@ -912,8 +1013,8 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
     write_stub_file(pane_id, rec)
     herdr("pane", "run", pane_id, stub_command(pane_id))
     try:
-        if label and not label.startswith("💤"):
-            herdr("tab", "rename", tab_id, "💤 %s" % label)
+        if marked_label and label != marked_label:
+            herdr("tab", "rename", tab_id, marked_label)
     except RuntimeError:
         pass
     log("HIBERNATED %s (%s, idle %s, freed ~%dMB, killed tree of pid %d [%s])" % (
@@ -1037,6 +1138,8 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
             # (Accept any session uuid: right after a resume Herdr may not have
             # picked the session identity up yet.)
             if not dry_run:
+                if not restore_owned_tab_label(pane_id, pane, rec, state):
+                    continue
                 log("RESUMED %s (%s)" % (label, pane_id), echo=False)
                 del state[pane_id]
                 remove_stub_file(pane_id)
@@ -1123,33 +1226,39 @@ def cmd_scan(cfg=None):
 
 def cmd_watch():
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    old = watcher_pid()
-    if old and old != os.getpid():
-        sys.exit("watch already running (pid %d); use uninstall to stop it" % old)
-    with open(PID_FILE, "w") as fh:
-        fh.write(str(os.getpid()))
-    log("watch started (pid %d)" % os.getpid())
-    try:  # a fresh watcher usually means a fresh Herdr: re-arm dead stubs now
-        state = load_state()
-        if state:
-            panes, tab_labels = collect_panes()
-            restore_records(panes, tab_labels, state,
-                            forget_after=float(load_config()["FORGET_AFTER_MINUTES"]))
-    except Exception as exc:
-        log("startup restore failed: %s" % exc)
-    try:
-        while True:
-            cfg = load_config()  # re-read each pass so DRY_RUN flips take effect
-            try:
-                cmd_scan(cfg)
-            except Exception as exc:  # keep the loop alive
-                log("scan error: %s" % exc)
-            time.sleep(float(cfg["SCAN_INTERVAL_SECONDS"]))
-    finally:
+    with file_lock(WATCH_LOCK_FILE, blocking=False) as acquired:
+        if not acquired:
+            old = watcher_pid()
+            detail = " (pid %d)" % old if old else ""
+            sys.exit("watch already running%s" % detail)
+        with open(PID_FILE, "w") as fh:
+            fh.write(str(os.getpid()))
+        log("watch started (pid %d)" % os.getpid())
+        try:  # a fresh watcher usually means a fresh Herdr: re-arm dead stubs now
+            def startup_restore():
+                state = load_state()
+                if state:
+                    panes, tab_labels = collect_panes()
+                    restore_records(
+                        panes, tab_labels, state,
+                        forget_after=float(
+                            load_config()["FORGET_AFTER_MINUTES"]))
+            run_locked(startup_restore)
+        except Exception as exc:
+            log("startup restore failed: %s" % exc)
         try:
-            os.remove(PID_FILE)
-        except OSError:
-            pass
+            while True:
+                cfg = load_config()  # re-read each pass so DRY_RUN flips take effect
+                try:
+                    run_locked(cmd_scan, cfg)
+                except Exception as exc:  # keep the loop alive
+                    log("scan error: %s" % exc)
+                time.sleep(float(cfg["SCAN_INTERVAL_SECONDS"]))
+        finally:
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
 
 
 def cmd_now():
@@ -1238,6 +1347,20 @@ def cmd_forget(pane_id, resumed=False):
                             rec.get("label", "?"), pane_id), echo=not resumed)
     elif not resumed:
         print("no hibernation record for %s" % pane_id)
+
+
+def cmd_label_awake(pane_id):
+    """Restore this record's exact tool-owned tab label without clearing state."""
+    state = load_state()
+    rec = state.get(pane_id)
+    if not rec:
+        return
+    try:
+        pane = herdr("pane", "get", pane_id).get("pane", {})
+    except RuntimeError:
+        pane = {"tab_id": rec.get("tab_id", "")}
+    if not restore_owned_tab_label(pane_id, pane, rec, state):
+        sys.exit(1)
 
 
 SHELL_HOOK = """%s
@@ -1346,13 +1469,23 @@ def watcher_pid():
 
 def cmd_ensure():
     """Start the watcher if it is not already running (for shell rc hooks)."""
-    if watcher_pid():
-        return
-    subprocess.Popen(
-        [SELF, "watch"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL, start_new_session=True)
-    log("ensure: watcher was not running, started a new one", echo=False)
+    with file_lock(OPERATION_LOCK_FILE):
+        if watcher_lock_active():
+            return
+        proc = subprocess.Popen(
+            [SELF, "watch"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if watcher_lock_active():
+                log("ensure: watcher was not running, started pid %d" % proc.pid,
+                    echo=False)
+                return
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        log("ensure: watcher failed to acquire its lock", echo=False)
 
 
 def systemd_available():
@@ -1434,19 +1567,23 @@ def main():
     if cmd == "watch":
         cmd_watch()
     elif cmd == "scan":
-        cmd_scan()
+        run_locked(cmd_scan)
     elif cmd == "hibernate":
         if len(args) < 2:
             sys.exit("usage: herdr-hibernate hibernate <pane_id> [--force]")
-        cmd_hibernate(args[1], force="--force" in args)
+        run_locked(cmd_hibernate, args[1], force="--force" in args)
     elif cmd == "now":
-        cmd_now()
+        run_locked(cmd_now)
     elif cmd == "restore":
-        cmd_restore(dry_run="--dry-run" in args)
+        run_locked(cmd_restore, dry_run="--dry-run" in args)
     elif cmd == "forget":
         if len(args) < 2:
             sys.exit("usage: herdr-hibernate forget <pane_id> [--resumed]")
-        cmd_forget(args[1], resumed="--resumed" in args)
+        run_locked(cmd_forget, args[1], resumed="--resumed" in args)
+    elif cmd == "label-awake":
+        if len(args) < 2:
+            sys.exit("usage: herdr-hibernate label-awake <pane_id>")
+        run_locked(cmd_label_awake, args[1])
     elif cmd == "status":
         cmd_status()
     elif cmd == "ensure":
