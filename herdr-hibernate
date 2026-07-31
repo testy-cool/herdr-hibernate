@@ -64,9 +64,17 @@ UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA
 #   helper_tokens    cmdline substrings marking helper processes to ignore
 #   replay_flags     flags captured from the killed process's argv and appended
 #                    to resume_argv, so a resume keeps e.g. the model override
+#   activity_globs   extra files whose timestamped writes count as session
+#                    activity even though the main transcript is untouched
 AGENTS = {
     "claude": {
         "transcript_glob": os.path.expanduser("~/.claude/projects/*/{sid}.jsonl"),
+        # An orchestrator with background sub-agents (Agent tool / workflows)
+        # sits at its prompt while the workers append here — the main jsonl
+        # goes stale even though the session is mid-flight. Counting these
+        # keeps a watching orchestrator from ever classifying as idle.
+        "activity_globs": (
+            os.path.expanduser("~/.claude/projects/*/{sid}/subagents/*.jsonl"),),
         "bin": "claude",
         "resume_argv": ["claude", "--resume", "{sid}"],
         "session_in_args": r"--resume\s+(%s)" % UUID_RE,
@@ -136,6 +144,15 @@ CONFIG_KEYS = [
     ("LOG_MAX_KB", "512",
      "Rotate hibernate.log past this size (one .1 backup is kept, so the log\n"
      "never holds more than twice this). Old lines about closed tabs age out."),
+    ("BUSY_CHILD_MINUTES", "3",
+     "An idle agent whose process tree contains a child that started this many\n"
+     "minutes AFTER the agent itself is treated as waiting on a background job\n"
+     "(a monitor, `herdr wait`, a build) and is never hibernated while that\n"
+     "child runs. Startup-time children (MCP servers, helpers) are older than\n"
+     "this gap and don't count. 0 disables the check."),
+    ("BUSY_IGNORE_TOKENS", '"mcp"',
+     "Space-separated case-insensitive substrings; a child process whose\n"
+     "command line matches one is ignored by the background-job check."),
 ]
 
 DEFAULT_CONFIG = "# herdr-hibernate configuration (KEY=VALUE, bash-sourceable)\n" + "".join(
@@ -360,12 +377,21 @@ def last_entry_epoch(path, allow_epoch=False):
 
 
 def transcript_age_minutes(uuid, agent="claude"):
-    """Minutes since this session's last real activity, or None if no transcript."""
+    """Minutes since this session's last real activity, or None if no transcript.
+
+    Activity is the newest stamped entry across the main transcript AND the
+    agent's activity_globs (e.g. claude sub-agent transcripts): an orchestrator
+    whose background workers are still writing is active, not idle.
+    """
     spec = AGENTS.get(agent)
     if spec is None:
         return None
+    patterns = (spec["transcript_glob"],) + tuple(spec.get("activity_globs", ()))
+    paths = [p for pat in patterns for p in glob.glob(pat.format(sid=uuid))]
+    if not glob.glob(spec["transcript_glob"].format(sid=uuid)):
+        return None  # resumability needs the MAIN transcript, whatever else exists
     newest = None
-    for path in glob.glob(spec["transcript_glob"].format(sid=uuid)):
+    for path in paths:
         stamp = last_entry_epoch(path, spec.get("epoch_ts", False))
         if stamp is None:  # unreadable/unstamped — fall back to the file clock
             try:
@@ -594,6 +620,41 @@ def find_agent_proc(pane_id, uuid, agent):
     return found[0]["pid"], found[0]
 
 
+def busy_background_job(pane_id, uuid, agent, cfg):
+    """Cmdline of a live background job the agent spawned, or None.
+
+    An idle agent's children normally all date from session startup (MCP
+    servers, helpers). A descendant that appeared BUSY_CHILD_MINUTES or more
+    after the agent root started is work the agent launched and is still
+    waiting on — a background monitor, `herdr wait`, a build. The pane only
+    LOOKS idle; killing it would orphan that work and lose the wake-up, so
+    such a pane is never hibernated automatically.
+    """
+    late = float(cfg["BUSY_CHILD_MINUTES"])
+    if late <= 0:
+        return None
+    pid, _proc = find_agent_proc(pane_id, uuid, agent)
+    if pid is None:
+        return None
+    root_up = proc_uptime_minutes(pid)
+    if root_up is None:
+        return None
+    ignore = [t.strip().lower() for t in cfg["BUSY_IGNORE_TOKENS"].split()]
+    ignore += [t.strip().lower() for t in AGENTS[agent]["helper_tokens"]]
+    ignore = [t for t in ignore if t]
+    procs = ps_snapshot()
+    for child in descendants(pid, procs):
+        args = procs.get(child, (0, 0, ""))[2]
+        if any(tok in args.lower() for tok in ignore):
+            continue
+        child_up = proc_uptime_minutes(child)
+        if child_up is None:  # already gone — transient, not a background job
+            continue
+        if root_up - child_up >= late:
+            return args[:60]
+    return None
+
+
 # ------------------------------------------------------------ classification
 
 def classify(pane, tab_labels, cfg, state, self_pane):
@@ -641,6 +702,12 @@ def classify(pane, tab_labels, cfg, state, self_pane):
     threshold = float(cfg["HIBERNATE_AFTER_MINUTES"])
     if age < threshold:
         return "skip", "idle only %s (< %sm threshold)" % (fmt_idle(age), int(threshold))
+
+    # Last (it costs a process-info call): an "idle" agent that spawned a
+    # still-running background job is watching something, not idle.
+    job = busy_background_job(pane_id, uuid, agent, cfg)
+    if job:
+        return "skip", "busy: background job running (%s)" % job
 
     return "hibernate", "idle %s" % fmt_idle(age)
 
@@ -1286,9 +1353,9 @@ def cmd_now():
 def cmd_hibernate(pane_id, force=False, notify=False):
     """Manual hibernate: bypasses the idle-time threshold, keeps all safety rules.
 
-    `force` additionally skips the just-resumed guard (an explicit request is
-    not a mistake). The guard that refuses to kill a pane's own shell always
-    applies — that one would close the tab.
+    `force` additionally skips the just-resumed guard and the background-job
+    guard (an explicit request is not a mistake). The guard that refuses to
+    kill a pane's own shell always applies — that one would close the tab.
     """
     cfg = load_config()
     dry_run = cfg["DRY_RUN"] != "0"
@@ -1311,7 +1378,13 @@ def cmd_hibernate(pane_id, force=False, notify=False):
     if decision == "exempt":
         fail("refusing: %s" % reason)
     if decision == "skip" and not reason.startswith("idle only"):
-        fail("cannot hibernate: %s" % reason)
+        # `--force` may override the background-job guard — an explicit request
+        # is not a mistake — but nothing else.
+        if force and reason.startswith("busy:"):
+            log("force: overriding background-job guard on %s (%s)" % (
+                pane_id, reason))
+        else:
+            fail("cannot hibernate: %s" % reason)
     uuid = session_uuid(pane)
     idle = fmt_idle(transcript_age_minutes(uuid, pane.get("agent", "claude")))
     before = len(state)

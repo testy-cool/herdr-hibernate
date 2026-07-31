@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -159,6 +160,112 @@ class HibernateTests(unittest.TestCase):
         result = hibernate.marker_record(
             "💤 Shared tab", "w1:t1", {"w1:p1": existing})
         self.assertEqual(result, ("Shared tab", "💤 Shared tab", True))
+
+
+class WatcherGuardTests(unittest.TestCase):
+    """Guards that keep a watching orchestrator from being hibernated."""
+
+    SID = "11111111-1111-1111-1111-111111111111"
+
+    @staticmethod
+    def _cfg(**over):
+        cfg = dict(hibernate.DEFAULTS)
+        cfg.update(over)
+        return cfg
+
+    @staticmethod
+    def _write_jsonl(path, age_seconds):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S",
+                              time.gmtime(time.time() - age_seconds))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"timestamp":"%s","type":"assistant"}\n' % stamp)
+
+    def _claude_spec(self, root):
+        spec = dict(hibernate.AGENTS["claude"])
+        spec["transcript_glob"] = os.path.join(root, "{sid}.jsonl")
+        spec["activity_globs"] = (
+            os.path.join(root, "{sid}", "subagents", "*.jsonl"),)
+        return spec
+
+    def test_subagent_writes_count_as_session_activity(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write_jsonl(os.path.join(root, self.SID + ".jsonl"),
+                              age_seconds=3 * 3600)  # main stale for 3h
+            subdir = os.path.join(root, self.SID, "subagents")
+            os.makedirs(subdir)
+            self._write_jsonl(os.path.join(subdir, "agent-worker.jsonl"),
+                              age_seconds=60)  # worker wrote a minute ago
+            with mock.patch.dict(hibernate.AGENTS,
+                                 {"claude": self._claude_spec(root)}):
+                age = hibernate.transcript_age_minutes(self.SID, "claude")
+            self.assertIsNotNone(age)
+            self.assertLess(age, 10)
+
+    def test_subagent_files_alone_do_not_make_a_session_resumable(self):
+        with tempfile.TemporaryDirectory() as root:
+            subdir = os.path.join(root, self.SID, "subagents")
+            os.makedirs(subdir)
+            self._write_jsonl(os.path.join(subdir, "agent-worker.jsonl"), 60)
+            with mock.patch.dict(hibernate.AGENTS,
+                                 {"claude": self._claude_spec(root)}):
+                age = hibernate.transcript_age_minutes(self.SID, "claude")
+            self.assertIsNone(age)  # no main transcript -> never killed anyway
+
+    def test_late_started_child_is_a_busy_background_job(self):
+        procs = {
+            100: (1, 0, "claude"),
+            101: (100, 0, "bash -c 'herdr wait agent-status w1:p2 --status done'"),
+        }
+        ups = {100: 120.0, 101: 4.0}  # child began ~116m after the agent
+        with mock.patch.object(hibernate, "find_agent_proc",
+                               return_value=(100, {})), \
+                mock.patch.object(hibernate, "ps_snapshot", return_value=procs), \
+                mock.patch.object(hibernate, "proc_uptime_minutes",
+                                  side_effect=ups.get):
+            job = hibernate.busy_background_job("w1:p1", self.SID, "claude",
+                                                self._cfg())
+        self.assertIsNotNone(job)
+        self.assertIn("herdr wait", job)
+
+    def test_startup_children_and_mcp_servers_do_not_count(self):
+        procs = {
+            100: (1, 0, "claude"),
+            101: (100, 0, "node /x/mcp-server-figma"),  # late but ignored token
+            102: (100, 0, "node /x/some-helper"),       # started with the agent
+        }
+        ups = {100: 120.0, 101: 4.0, 102: 119.5}
+        with mock.patch.object(hibernate, "find_agent_proc",
+                               return_value=(100, {})), \
+                mock.patch.object(hibernate, "ps_snapshot", return_value=procs), \
+                mock.patch.object(hibernate, "proc_uptime_minutes",
+                                  side_effect=ups.get):
+            job = hibernate.busy_background_job("w1:p1", self.SID, "claude",
+                                                self._cfg())
+        self.assertIsNone(job)
+
+    def test_zero_minutes_disables_the_busy_check(self):
+        with mock.patch.object(hibernate, "find_agent_proc") as finder:
+            job = hibernate.busy_background_job(
+                "w1:p1", self.SID, "claude",
+                self._cfg(BUSY_CHILD_MINUTES="0"))
+        self.assertIsNone(job)
+        finder.assert_not_called()
+
+    def test_classify_skips_a_pane_with_a_busy_background_job(self):
+        pane = {
+            "pane_id": "w1:p1", "tab_id": "w1:t1", "agent": "claude",
+            "agent_status": "idle",
+            "agent_session": {"value": self.SID},
+        }
+        with mock.patch.object(hibernate, "transcript_age_minutes",
+                               return_value=999.0), \
+                mock.patch.object(hibernate, "busy_background_job",
+                                  return_value="herdr wait agent-status w1:p2"):
+            decision, reason = hibernate.classify(
+                pane, {"w1:t1": "KB Delta orchestrator"}, self._cfg(),
+                {}, "w9:p9")
+        self.assertEqual(decision, "skip")
+        self.assertTrue(reason.startswith("busy:"))
 
 
 if __name__ == "__main__":
