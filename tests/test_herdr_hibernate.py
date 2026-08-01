@@ -243,6 +243,42 @@ class WatcherGuardTests(unittest.TestCase):
                                                 self._cfg())
         self.assertIsNone(job)
 
+    def test_reexeced_agent_binary_is_not_a_background_job(self):
+        # codex node wrapper (root) relaunched its vendored TUI 71m in; the
+        # TUI carries the session id, its code-mode-host helper follows 26s
+        # later. Neither is background work.
+        procs = {
+            100: (1, 0, "node /x/bin/codex resume %s -c model=y" % self.SID),
+            101: (100, 0, "/x/vendor/bin/codex resume %s -c model=y" % self.SID),
+            102: (101, 0, "/x/vendor/bin/codex-code-mode-host"),
+        }
+        ups = {100: 120.0, 101: 49.0, 102: 48.5}
+        with mock.patch.object(hibernate, "find_agent_proc",
+                               return_value=(100, {})), \
+                mock.patch.object(hibernate, "ps_snapshot", return_value=procs), \
+                mock.patch.object(hibernate, "proc_uptime_minutes",
+                                  side_effect=ups.get):
+            job = hibernate.busy_background_job("w1:p1", self.SID, "codex",
+                                                self._cfg())
+        self.assertIsNone(job)
+
+    def test_worker_spawned_after_a_reexec_still_counts(self):
+        procs = {
+            100: (1, 0, "node /x/bin/codex resume %s" % self.SID),
+            101: (100, 0, "/x/vendor/bin/codex resume %s" % self.SID),
+            102: (101, 0, "codex exec --session other 'review the diff'"),
+        }
+        ups = {100: 120.0, 101: 49.0, 102: 10.0}  # worker began 39m after re-exec
+        with mock.patch.object(hibernate, "find_agent_proc",
+                               return_value=(100, {})), \
+                mock.patch.object(hibernate, "ps_snapshot", return_value=procs), \
+                mock.patch.object(hibernate, "proc_uptime_minutes",
+                                  side_effect=ups.get):
+            job = hibernate.busy_background_job("w1:p1", self.SID, "codex",
+                                                self._cfg())
+        self.assertIsNotNone(job)
+        self.assertIn("codex exec", job)
+
     def test_zero_minutes_disables_the_busy_check(self):
         with mock.patch.object(hibernate, "find_agent_proc") as finder:
             job = hibernate.busy_background_job(

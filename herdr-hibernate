@@ -643,14 +643,29 @@ def busy_background_job(pane_id, uuid, agent, cfg):
     ignore += [t.strip().lower() for t in AGENTS[agent]["helper_tokens"]]
     ignore = [t for t in ignore if t]
     procs = ps_snapshot()
-    for child in descendants(pid, procs):
+    kids = descendants(pid, procs)
+    # An agent can re-exec its own binary mid-session (codex's node wrapper
+    # relaunches the vendored TUI on an in-place resume). Those processes
+    # carry the pane's session id in their argv: they ARE the agent, not
+    # background work — and helpers spawned right after them are startup
+    # children of that re-exec, so the "late" clock runs from the youngest
+    # such process, not from the original wrapper.
+    epoch_up = root_up
+    for child in kids:
+        if uuid and uuid in procs.get(child, (0, 0, ""))[2]:
+            up = proc_uptime_minutes(child)
+            if up is not None:
+                epoch_up = min(epoch_up, up)
+    for child in kids:
         args = procs.get(child, (0, 0, ""))[2]
+        if uuid and uuid in args:
+            continue  # the agent's own (re-exec'd) session process
         if any(tok in args.lower() for tok in ignore):
             continue
         child_up = proc_uptime_minutes(child)
         if child_up is None:  # already gone — transient, not a background job
             continue
-        if root_up - child_up >= late:
+        if epoch_up - child_up >= late:
             return args[:60]
     return None
 
