@@ -169,6 +169,25 @@ class HibernateTests(unittest.TestCase):
         self.assertIn(
             ("workspace", "rename", "work-a", "My project"), calls)
 
+    def test_agent_name_restores_after_wake(self):
+        restore = getattr(hibernate, "restore_owned_agent_name", None)
+        self.assertIsNotNone(restore, "agent name restore is missing")
+        if restore is None:
+            return
+        rec = {"agent_name": "project-worker"}
+        calls = []
+
+        def fake_herdr(*args):
+            calls.append(args)
+            return {}
+
+        with mock.patch.object(hibernate, "herdr", side_effect=fake_herdr):
+            ok = restore("p1", {"pane_id": "p1"}, rec)
+
+        self.assertTrue(ok)
+        self.assertIn(
+            ("agent", "rename", "p1", "project-worker"), calls)
+
     def test_project_wake_releases_its_workspace_marker(self):
         release = getattr(hibernate, "release_workspace_marker", None)
         self.assertIsNotNone(release, "workspace marker release is missing")

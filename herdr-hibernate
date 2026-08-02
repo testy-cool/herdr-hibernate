@@ -989,6 +989,20 @@ def restore_owned_workspace_label(pane_id, rec, state):
     return True
 
 
+def restore_owned_agent_name(pane_id, pane, rec):
+    """Restore a Herdr agent name unless someone already chose another one."""
+    desired = rec.get("agent_name")
+    current = pane.get("name")
+    if not desired or current:
+        return True
+    try:
+        herdr("agent", "rename", pane_id, desired)
+    except RuntimeError as exc:
+        log("AGENT NAME retry %s: %s" % (pane_id, exc), echo=False)
+        return False
+    return True
+
+
 def release_workspace_marker(workspace_id, records, state):
     """Release one workspace-level marker before a deliberate project wake."""
     owned = [rec for _pane_id, rec in records
@@ -1119,6 +1133,7 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
     rec = {
         "uuid": uuid, "agent": agent,
         "resume": build_resume(agent, uuid, proc, cwd),
+        "agent_name": pane.get("name"),
         "workspace_id": pane.get("workspace_id", ""),
         "tab_id": tab_id, "label": original_label, "cwd": cwd,
         "marker_added": marker_added, "marked_label": marked_label,
@@ -1268,6 +1283,8 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                 if not restore_owned_tab_label(pane_id, pane, rec, state):
                     continue
                 if not restore_owned_workspace_label(pane_id, rec, state):
+                    continue
+                if not restore_owned_agent_name(pane_id, pane, rec):
                     continue
                 log("RESUMED %s (%s)" % (label, pane_id), echo=False)
                 del state[pane_id]
