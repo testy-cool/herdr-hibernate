@@ -131,7 +131,8 @@ before killing anything if an agent is working, blocked, unsupported, pinned,
 or lacks a verified session; it also refuses a pane running an arbitrary
 non-agent command because that command has no proven restore path. Empty shell
 panes are left in place. A parked workspace keeps its exact Herdr tabs, panes,
-split layout, and working directories, and is marked with `💤`. Toggle it again
+split layout, working directories, and agent names, and is marked with `💤`.
+Toggle it again
 to restore every agent pane, staggered by
 `WORKSPACE_WAKE_STAGGER_SECONDS` to avoid one large startup spike.
 
