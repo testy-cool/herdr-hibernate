@@ -87,6 +87,9 @@ past the threshold — and re-checks the status immediately before killing.
 ./herdr-hibernate now                # hibernate the FOCUSED pane (what the keybinding calls)
 ./herdr-hibernate hibernate w2:p3    # manual: skips idle-time threshold, keeps all safety rules
 ./herdr-hibernate hibernate w2:p3 --force   # ...also skip the just-resumed guard
+./herdr-hibernate hibernate-workspace w2   # park every safe agent pane as one project
+./herdr-hibernate wake-workspace w2        # resume every parked pane in that project
+./herdr-hibernate workspace-toggle         # hibernate/wake the focused workspace
 ./herdr-hibernate forget w2:p3       # drop a pane's hibernation record + stub
 ./herdr-hibernate install            # shell hook + background watcher
 ./herdr-hibernate uninstall          # stop + remove the background watcher
@@ -112,6 +115,25 @@ description = "hibernate focused pane"
 ```
 
 Apply without restarting Herdr: `herdr server reload-config`.
+
+To toggle an entire project workspace with `Ctrl-A`, then `Shift-Z`:
+
+```toml
+[[keys.command]]
+key = "prefix+shift+z"
+type = "plugin_action"
+command = "bengemine.hibernate.workspace-toggle"
+description = "hibernate or wake focused workspace"
+```
+
+The workspace action is deliberately all-or-nothing at preflight. It refuses
+before killing anything if an agent is working, blocked, unsupported, pinned,
+or lacks a verified session; it also refuses a pane running an arbitrary
+non-agent command because that command has no proven restore path. Empty shell
+panes are left in place. A parked workspace keeps its exact Herdr tabs, panes,
+split layout, and working directories, and is marked with `💤`. Toggle it again
+to restore every agent pane, staggered by
+`WORKSPACE_WAKE_STAGGER_SECONDS` to avoid one large startup spike.
 
 (If you run the script standalone instead of as a plugin, use
 `type = "shell"` with the absolute path to `herdr-hibernate now`.)
@@ -140,6 +162,7 @@ take effect without a restart.
 |---|---|---|
 | `HIBERNATE_AFTER_MINUTES` | `30` | Idle minutes (no transcript writes) before a pane qualifies. |
 | `SCAN_INTERVAL_SECONDS` | `120` | Delay between scans in `watch` mode. |
+| `WORKSPACE_WAKE_STAGGER_SECONDS` | `1` | Delay between pane resumes during a whole-workspace wake. |
 | `PIN_MARKER` | `📌` | Any tab/pane label containing this is never hibernated. |
 | `PINNED_TABS` | *(empty)* | Space-separated tab ids, never hibernated. |
 | `DRY_RUN` | `1` | `1` = log only, touch nothing. Set `0` only after reviewing the log. |
