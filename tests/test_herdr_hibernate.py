@@ -40,6 +40,25 @@ class HibernateTests(unittest.TestCase):
                     hibernate.WATCH_LOCK_FILE, blocking=False) as second:
                 self.assertFalse(second)
 
+    def test_codex_resume_replays_yolo_aliases(self):
+        sid = "90141d62-7130-4dd0-8083-211884e8e999"
+        for flag in (
+                "--yolo",
+                "--dangerously-bypass-approvals-and-sandbox"):
+            with self.subTest(flag=flag):
+                proc = {
+                    "argv": ["node", "/tmp/bin/codex", "-c",
+                             "model_reasoning_effort=xhigh", flag],
+                }
+
+                resume = hibernate.build_resume(
+                    "codex", sid, proc, "/tmp/project")
+
+                self.assertEqual(resume, [
+                    "codex", "resume", sid,
+                    "-c", "model_reasoning_effort=xhigh", flag,
+                ])
+
     def test_wake_restores_exact_owned_marker(self):
         rec = {
             "tab_id": "w1:t1",

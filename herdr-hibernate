@@ -91,7 +91,10 @@ AGENTS = {
         "replay_flags": ("-c", "-m", "--model", "-p", "--profile",
                          "-s", "--sandbox", "-a", "--ask-for-approval",
                          "-C", "--cd", "--add-dir"),
-        "replay_bool_flags": ("--oss",),
+        "replay_bool_flags": (
+            "--oss", "--yolo",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ),
     },
     "grok": {
         # xAI Grok Build. The session dir is named by the session uuid, nested
