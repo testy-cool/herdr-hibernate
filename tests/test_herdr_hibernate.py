@@ -40,6 +40,28 @@ class HibernateTests(unittest.TestCase):
                     hibernate.WATCH_LOCK_FILE, blocking=False) as second:
                 self.assertFalse(second)
 
+    def test_collect_panes_merges_names_from_agent_list(self):
+        def fake_herdr(*args):
+            if args == ("workspace", "list"):
+                return {"workspaces": [{"workspace_id": "work-a"}]}
+            if args[:2] == ("tab", "list"):
+                return {"tabs": []}
+            if args[:2] == ("pane", "list"):
+                return {"panes": [{
+                    "pane_id": "p1", "agent": "codex",
+                    "workspace_id": "work-a",
+                }]}
+            if args == ("agent", "list"):
+                return {"agents": [{
+                    "pane_id": "p1", "name": "project-worker",
+                }]}
+            raise AssertionError("unexpected Herdr call: %r" % (args,))
+
+        with mock.patch.object(hibernate, "herdr", side_effect=fake_herdr):
+            panes, _labels = hibernate.collect_panes()
+
+        self.assertEqual(panes[0]["name"], "project-worker")
+
     def test_codex_resume_replays_yolo_aliases(self):
         sid = "90141d62-7130-4dd0-8083-211884e8e999"
         for flag in (

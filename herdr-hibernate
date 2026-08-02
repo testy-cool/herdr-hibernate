@@ -467,6 +467,14 @@ def collect_panes():
         for tab in herdr("tab", "list", "--workspace", ws_id)["tabs"]:
             tab_labels[tab["tab_id"]] = tab.get("label", "")
         panes.extend(herdr("pane", "list", "--workspace", ws_id)["panes"])
+    agent_names = {
+        agent["pane_id"]: agent.get("name")
+        for agent in herdr("agent", "list").get("agents", [])
+        if agent.get("pane_id") and agent.get("name")
+    }
+    for pane in panes:
+        if pane["pane_id"] in agent_names:
+            pane["name"] = agent_names[pane["pane_id"]]
     return panes, tab_labels
 
 
