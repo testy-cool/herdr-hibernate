@@ -1,6 +1,6 @@
 id = "bengemine.hibernate"
 name = "Herdr Hibernate"
-version = "1.1.1"
+version = "1.2.0"
 min_herdr_version = "0.7.0"
 description = "Hibernate idle Claude Code, Codex, and Grok panes to ~0 RAM — kill the process tree, leave a tiny resume stub, press Enter to get the exact session back."
 # Tested on Linux and WSL2. macOS is untested: the background watcher falls back
@@ -30,6 +30,12 @@ id = "now"
 title = "Hibernate focused pane now"
 contexts = ["pane", "workspace"]
 command = ["./herdr-hibernate", "now"]
+
+[[actions]]
+id = "workspace-toggle"
+title = "Hibernate or wake focused workspace"
+contexts = ["workspace"]
+command = ["./herdr-hibernate", "workspace-toggle"]
 
 [[actions]]
 id = "restore"

@@ -16,7 +16,9 @@ Nothing is retained for a closed tab: when a pane disappears its record and
 stub script are deleted outright (after a short grace window), and the log is
 size-capped. The tool only ever holds data for panes that currently exist.
 
-Subcommands: watch | scan | restore | hibernate <pane_id> | forget <pane_id>
+Subcommands: watch | scan | restore | hibernate <pane_id>
+              hibernate-workspace <workspace_id> | wake-workspace <workspace_id>
+              workspace-toggle [workspace_id] | forget <pane_id>
               status | install | uninstall
 """
 
@@ -118,6 +120,8 @@ CONFIG_KEYS = [
      "Hibernate an agent pane after this many minutes without transcript writes."),
     ("SCAN_INTERVAL_SECONDS", "120",
      "Seconds between scans in `watch` mode."),
+    ("WORKSPACE_WAKE_STAGGER_SECONDS", "1",
+     "Seconds between agent launches when waking a whole workspace."),
     ("PIN_MARKER", "📌",
      "Any tab or pane whose label contains this marker is never hibernated.\n"
      "This survives Herdr restarts (tab ids do not) — prefer it for durable pins."),
@@ -461,6 +465,22 @@ def collect_panes():
             tab_labels[tab["tab_id"]] = tab.get("label", "")
         panes.extend(herdr("pane", "list", "--workspace", ws_id)["panes"])
     return panes, tab_labels
+
+
+def workspace_records(workspace_id, panes, state):
+    """Tracked pane records belonging to a workspace.
+
+    Prefer the live pane's explicit workspace id. New records also persist the
+    id so a temporarily missing or renumbered pane remains attributable without
+    deriving anything from Herdr's opaque public ids.
+    """
+    live_workspace = {
+        pane["pane_id"]: pane.get("workspace_id") for pane in panes
+    }
+    return [
+        (pane_id, rec) for pane_id, rec in state.items()
+        if live_workspace.get(pane_id, rec.get("workspace_id")) == workspace_id
+    ]
 
 
 def session_uuid(pane):
@@ -935,6 +955,103 @@ def restore_owned_tab_label(pane_id, pane, rec, state):
     return True
 
 
+def record_marked_workspace_label(rec):
+    if rec.get("workspace_marker_added") is not True:
+        return None
+    return rec.get("marked_workspace_label")
+
+
+def restore_owned_workspace_label(pane_id, rec, state):
+    """Restore an exact workspace marker after its last parked pane wakes."""
+    marked = record_marked_workspace_label(rec)
+    workspace_id = rec.get("workspace_id", "")
+    if not marked or not workspace_id:
+        return True
+    if any(other_id != pane_id
+           and other.get("workspace_id") == workspace_id
+           and record_marked_workspace_label(other) == marked
+           for other_id, other in state.items()):
+        return True
+    try:
+        current = herdr("workspace", "get", workspace_id).get(
+            "workspace", {}).get("label", "")
+    except RuntimeError as exc:
+        log("WORKSPACE LABEL retry %s: %s" % (workspace_id, exc), echo=False)
+        return False
+    if current != marked:
+        return True
+    try:
+        herdr("workspace", "rename", workspace_id,
+              rec.get("workspace_label", ""))
+    except RuntimeError as exc:
+        log("WORKSPACE LABEL retry %s: %s" % (workspace_id, exc), echo=False)
+        return False
+    return True
+
+
+def release_workspace_marker(workspace_id, records, state):
+    """Release one workspace-level marker before a deliberate project wake."""
+    owned = [rec for _pane_id, rec in records
+             if rec.get("workspace_id") == workspace_id
+             and record_marked_workspace_label(rec)]
+    if not owned:
+        return True
+    rec = owned[0]
+    marked = record_marked_workspace_label(rec)
+    try:
+        current = herdr("workspace", "get", workspace_id).get(
+            "workspace", {}).get("label", "")
+        if current == marked:
+            herdr("workspace", "rename", workspace_id,
+                  rec.get("workspace_label", ""))
+    except RuntimeError as exc:
+        log("WORKSPACE LABEL retry %s: %s" % (workspace_id, exc), echo=False)
+        return False
+    for owned_rec in owned:
+        owned_rec["workspace_marker_added"] = False
+        owned_rec["marked_workspace_label"] = None
+    save_state(state)
+    return True
+
+
+def workspace_preflight(workspace_id, panes, tab_labels, cfg, state):
+    """Return safe hibernation targets and blockers for an all-project run."""
+    targets, blockers = [], []
+    for pane in panes:
+        if pane.get("workspace_id") != workspace_id:
+            continue
+        pane_id = pane["pane_id"]
+        if pane_id in state:
+            continue
+        if not pane.get("agent"):
+            info = pane_process_info(pane_id)
+            if bare_shell(info):
+                continue
+            blockers.append("%s: non-agent process is running" % pane_id)
+            continue
+
+        decision, reason = classify(pane, tab_labels, cfg, state, "")
+        allowed = (decision == "hibernate"
+                   or (decision == "skip" and reason.startswith("idle only")))
+        if not allowed:
+            blockers.append("%s: %s" % (pane_id, reason))
+            continue
+
+        uuid = session_uuid(pane)
+        pid, proc = find_agent_proc(pane_id, uuid, pane.get("agent"))
+        if pid is None:
+            blockers.append("%s: %s" % (pane_id, proc))
+            continue
+        info = pane_process_info(pane_id)
+        if info and pid == info.get("shell_pid"):
+            blockers.append("%s: agent is the pane shell" % pane_id)
+            continue
+        idle = fmt_idle(transcript_age_minutes(
+            uuid, pane.get("agent", "claude")))
+        targets.append((pane, idle))
+    return targets, blockers
+
+
 def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False):
     pane_id = pane["pane_id"]
     tab_id = pane.get("tab_id", "")
@@ -1002,6 +1119,7 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
     rec = {
         "uuid": uuid, "agent": agent,
         "resume": build_resume(agent, uuid, proc, cwd),
+        "workspace_id": pane.get("workspace_id", ""),
         "tab_id": tab_id, "label": original_label, "cwd": cwd,
         "marker_added": marker_added, "marked_label": marked_label,
         "freed_mb": rss_mb, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1029,6 +1147,13 @@ def forget_record(pane_id, state, why):
     and cwd leave the tool entirely. The transcript itself is Claude Code's
     own data under ~/.claude/projects and is never touched here.
     """
+    rec = state.get(pane_id)
+    if rec:
+        # A workspace marker belongs to the parked-record set, not forever to
+        # the workspace. Best effort is correct here: if the workspace itself
+        # was closed there is no label left to restore, but we must still erase
+        # the now-useless record.
+        restore_owned_workspace_label(pane_id, rec, state)
     rec = state.pop(pane_id, None)
     save_state(state)
     remove_stub_file(pane_id)
@@ -1115,6 +1240,8 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
             remove_stub_file(pane_id)
             del state[pane_id]
             rec["tab_id"] = pane.get("tab_id", rec.get("tab_id", ""))
+            rec["workspace_id"] = pane.get(
+                "workspace_id", rec.get("workspace_id", ""))
             state[live_id] = rec
             save_state(state)
             pane_id = live_id
@@ -1139,6 +1266,8 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
             # picked the session identity up yet.)
             if not dry_run:
                 if not restore_owned_tab_label(pane_id, pane, rec, state):
+                    continue
+                if not restore_owned_workspace_label(pane_id, rec, state):
                     continue
                 log("RESUMED %s (%s)" % (label, pane_id), echo=False)
                 del state[pane_id]
@@ -1336,9 +1465,146 @@ def cmd_restore(dry_run=False):
         n, len(load_state())))
 
 
+def mark_workspace_hibernated(workspace_id, pane_ids, state):
+    """Mark a fully parked workspace and attach marker ownership to records."""
+    workspace = herdr("workspace", "get", workspace_id).get("workspace", {})
+    label = workspace.get("label", "")
+    marked = "💤 %s" % label if label and not label.startswith("💤") else None
+    added = bool(marked)
+    for pane_id in pane_ids:
+        rec = state.get(pane_id)
+        if not rec:
+            continue
+        rec["workspace_id"] = workspace_id
+        rec["workspace_label"] = label
+        rec["workspace_marker_added"] = added
+        rec["marked_workspace_label"] = marked
+    save_state(state)
+    if marked:
+        herdr("workspace", "rename", workspace_id, marked)
+
+
+def cmd_hibernate_workspace(workspace_id, notify=False):
+    """Hibernate every safely resumable agent in one workspace as a batch."""
+    cfg = load_config()
+    dry_run = cfg["DRY_RUN"] != "0"
+    state = load_state()
+    panes, tab_labels = collect_panes()
+    restore_records(panes, tab_labels, state,
+                    forget_after=float(cfg["FORGET_AFTER_MINUTES"]))
+    targets, blockers = workspace_preflight(
+        workspace_id, panes, tab_labels, cfg, state)
+    if blockers:
+        msg = "; ".join(blockers)
+        if notify:
+            toast("Project not hibernated", msg[:160], sound="request")
+        sys.exit(msg)
+    if not targets:
+        msg = "no live resumable agents in workspace %s" % workspace_id
+        if notify:
+            toast("Nothing to hibernate", msg, sound="request")
+        sys.exit(msg)
+
+    parked = []
+    for pane, idle in targets:
+        if hibernate_pane(
+                pane, tab_labels, cfg, state, idle, dry_run, force=True):
+            parked.append(pane["pane_id"])
+    if dry_run:
+        print("(dry-run — workspace %s has %d safe agent pane%s)" % (
+            workspace_id, len(targets), "" if len(targets) == 1 else "s"))
+        return
+    if len(parked) != len(targets):
+        msg = "only %d of %d panes hibernated; see %s" % (
+            len(parked), len(targets), LOG_FILE)
+        if notify:
+            toast("Project partly hibernated", msg[:160], sound="request")
+        sys.exit(msg)
+
+    all_parked = [pane_id for pane_id, _ in workspace_records(
+        workspace_id, panes, state)]
+    mark_workspace_hibernated(workspace_id, all_parked, state)
+    freed = sum(state[pane_id].get("freed_mb", 0) for pane_id in all_parked)
+    log("HIBERNATED workspace %s (%d pane%s, freed ~%dMB)" % (
+        workspace_id, len(all_parked), "" if len(all_parked) == 1 else "s",
+        freed))
+    if notify:
+        toast("Project hibernated", "%d agent pane%s · freed ~%dMB" % (
+            len(all_parked), "" if len(all_parked) == 1 else "s", freed))
+
+
+def cmd_wake_workspace(workspace_id, notify=False):
+    """Press Enter in every armed stub belonging to one workspace."""
+    cfg = load_config()
+    state = load_state()
+    panes, tab_labels = collect_panes()
+    restore_records(panes, tab_labels, state,
+                    forget_after=float(cfg["FORGET_AFTER_MINUTES"]))
+    state = load_state()
+    records = workspace_records(workspace_id, panes, state)
+    if not records:
+        msg = "no hibernated panes in workspace %s" % workspace_id
+        if notify:
+            toast("Nothing to wake", msg, sound="request")
+        sys.exit(msg)
+    dead = [pane_id for pane_id, _ in records
+            if not stub_alive(pane_process_info(pane_id))]
+    if dead:
+        msg = "stubs are not armed: %s" % ", ".join(dead)
+        if notify:
+            toast("Project wake failed", msg[:160], sound="request")
+        sys.exit(msg)
+
+    if not release_workspace_marker(workspace_id, records, state):
+        msg = "could not restore workspace label"
+        if notify:
+            toast("Project wake failed", msg, sound="request")
+        sys.exit(msg)
+
+    delay = max(0.0, float(cfg["WORKSPACE_WAKE_STAGGER_SECONDS"]))
+    for i, (pane_id, _rec) in enumerate(records):
+        herdr("pane", "send-keys", pane_id, "enter")
+        if delay and i + 1 < len(records):
+            time.sleep(delay)
+    log("WAKING workspace %s (%d pane%s)" % (
+        workspace_id, len(records), "" if len(records) == 1 else "s"))
+    if notify:
+        toast("Project waking", "%d agent pane%s resuming" % (
+            len(records), "" if len(records) == 1 else "s"))
+
+
+def cmd_workspace_toggle(workspace_id=None, notify=False):
+    """Hibernate live agents, or wake the workspace when all are parked."""
+    if not workspace_id:
+        try:
+            pane = herdr("pane", "current").get("pane") or {}
+        except RuntimeError as exc:
+            if notify:
+                toast("Project toggle failed", str(exc)[:160], sound="request")
+            sys.exit(str(exc))
+        workspace_id = pane.get("workspace_id")
+    if not workspace_id:
+        sys.exit("could not determine focused workspace")
+
+    state = load_state()
+    panes, _tab_labels = collect_panes()
+    scoped = [p for p in panes if p.get("workspace_id") == workspace_id]
+    if any(p.get("agent") for p in scoped):
+        return cmd_hibernate_workspace(workspace_id, notify=notify)
+    if workspace_records(workspace_id, panes, state):
+        return cmd_wake_workspace(workspace_id, notify=notify)
+    msg = "workspace %s has no live or hibernated agents" % workspace_id
+    if notify:
+        toast("Nothing to toggle", msg, sound="request")
+    sys.exit(msg)
+
+
 def cmd_forget(pane_id, resumed=False):
     """Drop a pane's hibernation record and stub (called by the stub on resume)."""
     state = load_state()
+    rec = state.get(pane_id)
+    if rec:
+        restore_owned_workspace_label(pane_id, rec, state)
     rec = state.pop(pane_id, None)
     save_state(state)
     remove_stub_file(pane_id)
@@ -1360,6 +1626,8 @@ def cmd_label_awake(pane_id):
     except RuntimeError:
         pane = {"tab_id": rec.get("tab_id", "")}
     if not restore_owned_tab_label(pane_id, pane, rec, state):
+        sys.exit(1)
+    if not restore_owned_workspace_label(pane_id, rec, state):
         sys.exit(1)
 
 
@@ -1574,6 +1842,17 @@ def main():
         run_locked(cmd_hibernate, args[1], force="--force" in args)
     elif cmd == "now":
         run_locked(cmd_now)
+    elif cmd == "hibernate-workspace":
+        if len(args) < 2:
+            sys.exit("usage: herdr-hibernate hibernate-workspace <workspace_id>")
+        run_locked(cmd_hibernate_workspace, args[1])
+    elif cmd == "wake-workspace":
+        if len(args) < 2:
+            sys.exit("usage: herdr-hibernate wake-workspace <workspace_id>")
+        run_locked(cmd_wake_workspace, args[1])
+    elif cmd == "workspace-toggle":
+        run_locked(cmd_workspace_toggle,
+                   args[1] if len(args) > 1 else None, notify=True)
     elif cmd == "restore":
         run_locked(cmd_restore, dry_run="--dry-run" in args)
     elif cmd == "forget":
