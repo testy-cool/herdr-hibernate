@@ -766,11 +766,18 @@ STUB_TEMPLATE = """\
 # herdr-hibernate stub for pane {pane_id} — session {uuid}
 # Auto-generated. Deleting this file only disables auto-resume for that pane.
 shopt -s execfail
+_hb_reset_terminal() {{
+    stty sane 2>/dev/null || true
+    # Interactive agents can leave these emulator modes enabled when killed.
+    # Focus reporting is what prints ^[[I/^[[O when Snipping Tool changes focus.
+    printf '\\033[?1004l\\033[?2004l\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l'
+}}
 # This script must always run as a CHILD of the pane's shell, never replace it
 # (no `exec bash <this>`). claude then ends up a child too, so killing claude at
 # the next hibernation leaves the pane's shell alive. If claude were the pane
 # shell itself, killing it would close the whole tab.
 _hb_bye() {{
+    _hb_reset_terminal
     printf '\\n\\033[1;31m%s\\033[0m\\n' 'hibernation stub dismissed.'
     printf 'resume this session by hand with:  %s\\n\\n' {resume_display}
     exit 0
@@ -778,6 +785,7 @@ _hb_bye() {{
 trap _hb_bye INT
 _hb_stub() {{
     export HERDR_HIBERNATE_STUB=1
+    _hb_reset_terminal
     cd {cwd} 2>/dev/null || cd "$HOME" || return 0
     printf '\\n\\033[1;35m%s\\033[0m\\n' {banner}
     printf '\\033[2m%s\\033[0m\\n\\n' {subtitle}
@@ -875,7 +883,12 @@ def stub_command(pane_id):
     Never `exec` here: the pane's own shell has to outlive both the stub and
     the claude it resumes, otherwise the next hibernation closes the tab.
     """
-    return "bash %s" % shlex.quote(pane_file(pane_id))
+    # Reset before starting the script as well as inside it. This closes the
+    # normal post-kill window where Codex or Grok can leave focus reporting on.
+    return ("stty sane 2>/dev/null || true; "
+            "printf '\\033[?1004l\\033[?2004l\\033[?1000l\\033[?1002l"
+            "\\033[?1003l\\033[?1006l'; bash %s"
+            % shlex.quote(pane_file(pane_id)))
 
 
 def pane_process_info(pane_id):

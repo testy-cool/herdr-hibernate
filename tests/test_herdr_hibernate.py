@@ -161,6 +161,35 @@ class HibernateTests(unittest.TestCase):
             "💤 Shared tab", "w1:t1", {"w1:p1": existing})
         self.assertEqual(result, ("Shared tab", "💤 Shared tab", True))
 
+    def test_stub_resets_terminal_before_banner_and_on_dismiss(self):
+        rec = {
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "agent": "codex",
+            "resume": ["codex", "resume",
+                       "11111111-1111-1111-1111-111111111111"],
+            "cwd": "/tmp",
+            "freed_mb": 100,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        path = hibernate.write_stub_file("w1:p1", rec)
+        with open(path, "r", encoding="utf-8") as fh:
+            body = fh.read()
+
+        self.assertIn("stty sane", body)
+        self.assertIn("\\033[?1004l", body)
+        self.assertIn("_hb_bye() {\n    _hb_reset_terminal", body)
+        self.assertIn("export HERDR_HIBERNATE_STUB=1\n"
+                      "    _hb_reset_terminal", body)
+        self.assertNotIn("\n    clear", body)
+
+    def test_arm_command_resets_terminal_before_starting_stub(self):
+        command = hibernate.stub_command("w1:p1")
+
+        self.assertLess(command.index("stty sane"), command.index("bash "))
+        self.assertIn("\\033[?1004l", command)
+        self.assertNotIn("clear", command)
+
 
 class WatcherGuardTests(unittest.TestCase):
     """Guards that keep a watching orchestrator from being hibernated."""
