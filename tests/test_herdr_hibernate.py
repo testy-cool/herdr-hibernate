@@ -1091,5 +1091,90 @@ class StubExcerptTests(unittest.TestCase):
         self.assertEqual(oct(os.stat(hibernate.PANES_DIR).st_mode)[-3:], "700")
 
 
+class JustResumedSessionTests(unittest.TestCase):
+    """Parking a pane you resumed a moment ago, before Herdr catches up."""
+
+    UUID = "11111111-1111-1111-1111-111111111111"
+    OTHER = "22222222-2222-2222-2222-222222222222"
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.paths = mock.patch.multiple(
+            hibernate, CONFIG_DIR=self.tempdir.name,
+            LOG_FILE=os.path.join(self.tempdir.name, "log"))
+        self.paths.start()
+        self.young = mock.patch.object(hibernate, "proc_uptime_minutes",
+                                       return_value=0.5)
+        self.young.start()
+
+    def tearDown(self):
+        self.young.stop()
+        self.paths.stop()
+        self.tempdir.cleanup()
+
+    def pane(self, agent="claude", session=None):
+        pane = {"pane_id": "w1:p1", "agent": agent}
+        if session is not None:
+            pane["agent_session"] = {"value": session}
+        return pane
+
+    def info(self, *cmdlines):
+        return {"shell_pid": 1,
+                "foreground_processes": [
+                    {"pid": 100 + n, "cmdline": line}
+                    for n, line in enumerate(cmdlines)]}
+
+    def test_herdr_is_still_the_first_answer(self):
+        uuid = hibernate.session_uuid(self.pane(session=self.UUID),
+                                      self.info("claude --resume " + self.OTHER))
+        self.assertEqual(uuid, self.UUID)
+
+    def test_a_resumed_claude_is_read_from_its_own_arguments(self):
+        uuid = hibernate.session_uuid(self.pane(),
+                                      self.info("claude --resume " + self.UUID))
+        self.assertEqual(uuid, self.UUID)
+
+    def test_a_resumed_codex_is_read_from_its_own_arguments(self):
+        uuid = hibernate.session_uuid(
+            self.pane("codex"),
+            self.info("codex resume %s --yolo" % self.UUID))
+        self.assertEqual(uuid, self.UUID)
+
+    def test_a_freshly_started_agent_still_has_no_id(self):
+        """No --resume means no session to name, and nothing to guess from."""
+        self.assertIsNone(hibernate.session_uuid(self.pane(),
+                                                 self.info("claude")))
+
+    def test_two_different_sessions_in_one_pane_are_refused(self):
+        uuid = hibernate.session_uuid(self.pane(), self.info(
+            "claude --resume " + self.UUID, "claude --resume " + self.OTHER))
+        self.assertIsNone(uuid)
+
+    def test_helper_processes_are_not_a_source(self):
+        uuid = hibernate.session_uuid(self.pane(), self.info(
+            "claude bg-pty-host --resume " + self.UUID))
+        self.assertIsNone(uuid)
+
+    def test_an_old_process_is_no_longer_trusted_to_name_its_session(self):
+        """By then Herdr has had its chance, and the arguments can be stale."""
+        with mock.patch.object(hibernate, "proc_uptime_minutes",
+                               return_value=90.0):
+            uuid = hibernate.session_uuid(
+                self.pane(), self.info("claude --resume " + self.UUID))
+        self.assertIsNone(uuid)
+
+    def test_classify_can_park_a_pane_herdr_has_not_caught_up_with(self):
+        pane = dict(self.pane(), agent_status="idle", tab_id="w1:t1")
+        cfg = dict(hibernate.DEFAULTS, HIBERNATE_AFTER_MINUTES="30",
+                   BUSY_CHILD_MINUTES="0")
+        with mock.patch.object(hibernate, "pane_process_info",
+                               return_value=self.info(
+                                   "claude --resume " + self.UUID)), \
+                mock.patch.object(hibernate, "transcript_age_minutes",
+                                  return_value=99.0):
+            decision, reason = hibernate.classify(pane, {}, cfg, {}, "")
+        self.assertEqual(decision, "hibernate", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

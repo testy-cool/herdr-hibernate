@@ -778,13 +778,60 @@ def workspace_records(workspace_id, panes, state):
     ]
 
 
-def session_uuid(pane):
+# How long after an agent starts its own arguments are trusted as the source of
+# a session id. Herdr normally reports the id within seconds; this only has to
+# cover that gap, and keeping it short bounds the one case where the arguments
+# lie — a session cleared or forked after being resumed, whose process still
+# names the id it was started with.
+ARGV_SESSION_WINDOW_MINUTES = 10
+
+
+def session_uuid(pane, info=None):
     sess = pane.get("agent_session")
     if isinstance(sess, dict) and sess.get("value"):
         return sess["value"]
     if pane.get("agent") == "grok":
-        return grok_session_id(pane)
-    return None
+        found = grok_session_id(pane)
+        if found:
+            return found
+    return resumed_session_in_args(pane, info)
+
+
+def resumed_session_in_args(pane, info=None):
+    """Recover a just-resumed session's id from the agent's own arguments.
+
+    Herdr repopulates agent_session on its own schedule, so for a short while
+    after a resume it reports nothing at all — and a pane resumed by mistake
+    cannot be parked again, which is exactly the moment you want to park it.
+    The process is not ambiguous about it: it was started as
+    `claude --resume <uuid>`, and that is what this reads.
+
+    Two different ids visible in one pane means something is happening that
+    this tool has no record of, so it declines rather than guessing which one
+    a kill would be safe for.
+    """
+    spec = AGENTS.get(pane.get("agent"))
+    if spec is None:
+        return None
+    info = pane_process_info(pane["pane_id"]) if info is None else info
+    ids = set()
+    for proc in (info or {}).get("foreground_processes") or []:
+        line = proc.get("cmdline") or ""
+        if any(token in line for token in spec["helper_tokens"]):
+            continue
+        found = re.search(spec["session_in_args"], line)
+        if not found:
+            continue
+        up = proc_uptime_minutes(proc.get("pid") or 0)
+        if up is None or up > ARGV_SESSION_WINDOW_MINUTES:
+            continue
+        ids.add(found.group(1))
+    if len(ids) != 1:
+        return None
+    uuid = ids.pop()
+    log("%s: read session %s from the agent's own arguments — Herdr has not "
+        "reported it yet" % (pane["pane_id"], uuid), echo=False)
+    return uuid
 
 
 def grok_session_id(pane):
@@ -994,7 +1041,8 @@ def classify(pane, tab_labels, cfg, state, self_pane):
 
     uuid = session_uuid(pane)
     if not uuid:
-        return "skip", "no session uuid — could not resume, never killing"
+        return "skip", ("Herdr has not reported this pane's session id yet — "
+                        "nothing to resume from, so never killing")
     if not re.fullmatch(UUID_RE, uuid):
         # `codex resume` also accepts session NAMES; a non-uuid could silently
         # resolve to a different session. Only kill what we can name exactly.

@@ -330,6 +330,19 @@ Enough to know what the pane was doing without resuming it, which is the point.
 - Grok panes get no excerpt yet — its transcript schema is unverified here, and
   a wrong excerpt is worse than none.
 
+## Changed your mind about a resume
+
+Press `Ctrl-A` `Shift-H` again. Parking a pane you have just resumed works
+immediately — the manual path already skips the idle threshold and the
+just-resumed guard, and the session id is read from the agent's own
+`--resume <uuid>` arguments during the short window before Herdr reports it
+again. Nothing has to be waited for.
+
+The arguments are only trusted for the first few minutes of an agent's life,
+which is all the gap there is to cover. After that a resumed session that was
+since cleared or forked would still be naming the id it started with, and
+Herdr's answer is the reliable one by then.
+
 ## Resume
 
 Press Enter in the pane. The stub restores the tab label and
