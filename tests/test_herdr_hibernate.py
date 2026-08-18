@@ -880,18 +880,21 @@ class LastExchangeTests(unittest.TestCase):
         ]):
             self.assertEqual(
                 hibernate.last_exchange("sid", "claude"),
-                ("why is staging returning 404",
-                 "The rewrite rule was wrong. Pushed a fix."))
+                [("user", "why is staging returning 404"),
+                 ("agent", "The rewrite rule was wrong. Pushed a fix.")])
 
-    def test_unanswered_prompt_is_not_paired_with_an_older_reply(self):
-        """Hibernating mid-turn must not attribute the previous answer."""
+    def test_an_unanswered_prompt_keeps_the_exchange_behind_it(self):
+        """Parked mid-turn, or after a throwaway `test`, the answered exchange
+        is what identifies the pane — but the new prompt must not be shown as
+        though the old answer replied to it."""
         with self.write("claude", "sid", [
             self.claude_user("first"),
             self.claude_agent("first answer"),
             self.claude_user("second, still running"),
         ]):
             self.assertEqual(hibernate.last_exchange("sid", "claude"),
-                             ("second, still running", ""))
+                             [("user", "first"), ("agent", "first answer"),
+                              ("user", "second, still running")])
 
     def test_machine_authored_user_entries_are_skipped(self):
         """Hooks, tool results, sub-agents and compaction are not the human."""
@@ -909,7 +912,8 @@ class LastExchangeTests(unittest.TestCase):
                 "This session is being continued from a previous conversation"),
         ]):
             self.assertEqual(hibernate.last_exchange("sid", "claude"),
-                             ("the real question", "the real answer"))
+                             [("user", "the real question"),
+                              ("agent", "the real answer")])
 
     def test_codex_reads_its_own_rollout_shape(self):
         with self.write("codex", "sid", [
@@ -919,7 +923,8 @@ class LastExchangeTests(unittest.TestCase):
             self.codex_message("assistant", "Added it and committed."),
         ]):
             self.assertEqual(hibernate.last_exchange("sid", "codex"),
-                             ("add the retry guard", "Added it and committed."))
+                             [("user", "add the retry guard"),
+                              ("agent", "Added it and committed.")])
 
     def test_a_prompt_buried_past_the_window_still_shows_the_reply(self):
         """Tool-heavy sessions can push every prompt out of the read window."""
@@ -932,7 +937,7 @@ class LastExchangeTests(unittest.TestCase):
             with mock.patch.object(hibernate, "EXCERPT_TAIL_BYTES", 8 * 1024), \
                     mock.patch.object(hibernate, "EXCERPT_WIDE_TAIL_BYTES", 8 * 1024):
                 self.assertEqual(hibernate.last_exchange("sid", "claude"),
-                                 ("", "the surviving answer"))
+                                 [("agent", "the surviving answer")])
 
     def test_widening_the_window_recovers_the_prompt(self):
         filler = {"type": "assistant",
@@ -943,7 +948,8 @@ class LastExchangeTests(unittest.TestCase):
         with self.write("claude", "sid", entries):
             with mock.patch.object(hibernate, "EXCERPT_TAIL_BYTES", 8 * 1024):
                 self.assertEqual(hibernate.last_exchange("sid", "claude"),
-                                 ("buried but reachable", "the answer"))
+                                 [("user", "buried but reachable"),
+                                  ("agent", "the answer")])
 
     def test_turns_are_returned_whole(self):
         """Shortening is the display's business, and it does not shorten either."""
@@ -951,17 +957,36 @@ class LastExchangeTests(unittest.TestCase):
             self.claude_user("word " * 400),
             self.claude_agent("reply " * 900),
         ]):
-            user, said = hibernate.last_exchange("sid", "claude")
-        self.assertEqual(user, ("word " * 400).strip())
-        self.assertEqual(said, ("reply " * 900).strip())
+            turns = hibernate.last_exchange("sid", "claude")
+        self.assertEqual(turns, [("user", ("word " * 400).strip()),
+                                 ("agent", ("reply " * 900).strip())])
+
+    def test_codex_citation_markup_is_not_part_of_the_reply(self):
+        """It is appended to the message text and is longer than some replies."""
+        with self.write("codex", "sid", [
+            self.codex_message("user", "ship it"),
+            self.codex_message("assistant", "Shipped. <oai-mem-citation>"
+                               "<citation_entries>notes/x.md:1-12</citation_entries>"
+                               "</oai-mem-citation>"),
+        ]):
+            self.assertEqual(hibernate.last_exchange("sid", "codex"),
+                             [("user", "ship it"), ("agent", "Shipped.")])
+
+    def test_markdown_links_keep_their_label(self):
+        with self.write("claude", "sid", [
+            self.claude_user("where is it"),
+            self.claude_agent("See the [README contract](/very/long/path.md:126)."),
+        ]):
+            self.assertEqual(hibernate.last_exchange("sid", "claude")[1],
+                             ("agent", "See the README contract."))
 
     def test_an_agent_without_a_reader_yields_no_excerpt(self):
         """Grok has no verified reader yet; that must degrade, not raise."""
         self.assertNotIn("turn_reader", hibernate.AGENTS["grok"])
-        self.assertEqual(hibernate.last_exchange("sid", "grok"), ("", ""))
+        self.assertEqual(hibernate.last_exchange("sid", "grok"), [])
 
     def test_a_missing_transcript_yields_no_excerpt(self):
-        self.assertEqual(hibernate.last_exchange("nope", "claude"), ("", ""))
+        self.assertEqual(hibernate.last_exchange("nope", "claude"), [])
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -993,9 +1018,11 @@ class StubExcerptTests(unittest.TestCase):
 
     def render(self, user, said, columns="100", **overrides):
         """Write a stub with a fixed excerpt and run it, returning what it printed."""
+        turns = [("user", user)] if user else []
+        turns += [("agent", said)] if said else []
         rec = dict(self.rec, **overrides)
         with mock.patch.object(hibernate, "last_exchange",
-                               return_value=(user, said)):
+                               return_value=turns):
             path = hibernate.write_stub_file("w1:p1", rec)
         # `bash -n` first: the excerpt is arbitrary human text interpolated into
         # a shell script, so a quoting slip would break the pane, not the pixels.
@@ -1061,7 +1088,7 @@ class StubExcerptTests(unittest.TestCase):
         reader.assert_not_called()
         with open(path, encoding="utf-8") as fh:
             body = fh.read()
-        self.assertIn("_hb_turn 'you' '' ", body)
+        self.assertNotIn("_hb_turn 'you'", body)  # defined, never called
 
     def test_excerpt_lines_settings_map_to_show_and_cap(self):
         self.assertEqual(hibernate._parse_excerpt_lines("all"), (True, 0))
@@ -1083,6 +1110,44 @@ class StubExcerptTests(unittest.TestCase):
                    ((row, "QQQ") for row in plain if "QQQ" in row)}
         columns |= {line.index("AAA") for line in plain if "AAA" in line}
         self.assertEqual(len(columns), 1, plain)
+
+    def test_an_unanswered_prompt_is_shown_under_the_exchange_it_follows(self):
+        """A pane parked right after `test` must still say what it was doing."""
+        turns = [("user", "port the retry guard"), ("agent", "Ported it."),
+                 ("user", "test")]
+        with mock.patch.object(hibernate, "last_exchange", return_value=turns):
+            path = hibernate.write_stub_file("w1:p1", self.rec)
+        run = subprocess.run(["bash", path], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True,
+                             env=dict(os.environ, COLUMNS="100", TERM="dumb"))
+        plain = ANSI_RE.sub("", run.stdout)
+        self.assertLess(plain.index("port the retry guard"), plain.index("Ported it."))
+        self.assertLess(plain.index("Ported it."), plain.index("test"))
+        self.assertLess(plain.index("test"), plain.index("press Enter"))
+
+    def test_the_subtitle_names_the_agent_and_a_short_id(self):
+        _, out = self.render("q", "a")
+        plain = ANSI_RE.sub("", out)
+        self.assertIn("claude 11111111 ·", plain)
+        self.assertNotIn(self.rec["uuid"] + " ·", plain)
+
+    def test_the_subtitle_abbreviates_the_home_directory(self):
+        _, out = self.render("q", "a", cwd=os.path.expanduser("~/Work/thing"))
+        self.assertIn("~/Work/thing", ANSI_RE.sub("", out))
+
+    def test_the_banner_and_subtitle_wrap_instead_of_running_off(self):
+        _, out = self.render("q", "a", columns="40",
+                             cwd="/very/long/path/" + "seg/" * 12)
+        plain = ANSI_RE.sub("", out)
+        banner = plain[plain.index("hibernated"):plain.index("plain shell")]
+        for line in banner.splitlines():
+            self.assertLessEqual(len(line), 40, line)
+
+    def test_the_hand_resume_command_is_never_wrapped(self):
+        """Folding it would put a newline through a command meant to be copied."""
+        _, out = self.render("q", "a", columns="40")
+        line = next(l for l in out.splitlines() if "resume this session" in l)
+        self.assertIn(self.rec["uuid"], line)
 
     def test_the_stub_is_owner_only(self):
         """It holds conversation text now, and transcripts carry pasted keys."""

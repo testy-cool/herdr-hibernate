@@ -472,6 +472,14 @@ MACHINE_TURN_PREFIXES = (
     "Caveat:", "This session is being continued from a previous conversation",
 )
 REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+# Codex appends its memory-citation markup to the message text itself, and it
+# is longer than some replies. Matched generically because the tag names have
+# already changed once.
+CITATION_RE = re.compile(r"<(oai-[a-z-]+|citation_entries|rollout_ids)\b.*?"
+                         r"(</\1>|$)", re.S)
+# `[label](path)` reads as punctuation soup at a glance; the label is the part
+# that carries meaning, and the stub is not a place anything gets clicked.
+MD_LINK_RE = re.compile(r"\[([^\]\n]{1,120})\]\((?:[^)\n]{0,300})\)")
 # A bare slash command (/compact, /clear) is an instruction to the harness, not
 # a turn in the conversation, and the last one is often the only thing standing
 # between the reader and the exchange they actually want to recognise.
@@ -515,6 +523,8 @@ def _clean_turn_text(text):
         return ""
     if BARE_COMMAND_RE.match(text):
         return ""
+    text = CITATION_RE.sub("", text)
+    text = MD_LINK_RE.sub(r"\1", text)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.M)  # headings read as noise
     text = re.sub(r"^\s*\|[\s|:-]*\|\s*$", "", text, flags=re.M)  # table rules
     text = text.replace("**", "").replace("`", "").replace("|", " ")
@@ -522,104 +532,69 @@ def _clean_turn_text(text):
 
 
 def _claude_turns(objects):
-    """(user, agent) text for a Claude Code transcript, newest exchange."""
-    user, agent = "", ""
-    for index in range(len(objects) - 1, -1, -1):
-        obj = objects[index]
-        if obj.get("type") != "user" or obj.get("isSidechain") or obj.get("isMeta"):
+    """Every real turn in a Claude Code transcript, oldest first."""
+    turns = []
+    for obj in objects:
+        kind = obj.get("type")
+        if kind not in ("user", "assistant") or obj.get("isSidechain"):
             continue
-        if obj.get("toolUseResult") is not None:
+        if kind == "user" and (obj.get("isMeta")
+                               or obj.get("toolUseResult") is not None):
             continue
         content = (obj.get("message") or {}).get("content")
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
             text = " ".join(block.get("text", "") for block in content
-                            if isinstance(block, dict) and block.get("type") == "text")
+                            if isinstance(block, dict)
+                            and block.get("type") == "text")
         else:
             continue
         text = _clean_turn_text(text)
-        if not text:
-            continue
-        user = text
-        # The reply is whatever the agent said AFTER that prompt. Searching
-        # forward (not backward from the end) is what keeps a still-running
-        # turn honest: a prompt with no answer yet shows as a prompt alone,
-        # never paired with the previous turn's reply.
-        for later in objects[index + 1:]:
-            if later.get("type") != "assistant" or later.get("isSidechain"):
-                continue
-            blocks = (later.get("message") or {}).get("content")
-            if not isinstance(blocks, list):
-                continue
-            said = _clean_turn_text(" ".join(
-                block.get("text", "") for block in blocks
-                if isinstance(block, dict) and block.get("type") == "text"))
-            if said:
-                agent = said
-        break
-    if not user:
-        agent = _claude_last_reply(objects)
-    return user, agent
-
-
-def _claude_last_reply(objects):
-    """Last assistant text alone, for a window holding no prompt at all.
-
-    A tool-heavy session can push every prompt out of the read window; half an
-    exchange still tells the supervisor which pane this is.
-    """
-    for obj in reversed(objects):
-        if obj.get("type") != "assistant" or obj.get("isSidechain"):
-            continue
-        blocks = (obj.get("message") or {}).get("content")
-        if not isinstance(blocks, list):
-            continue
-        said = _clean_turn_text(" ".join(
-            block.get("text", "") for block in blocks
-            if isinstance(block, dict) and block.get("type") == "text"))
-        if said:
-            return said
-    return ""
+        if text:
+            turns.append(("user" if kind == "user" else "agent", text))
+    return turns
 
 
 def _codex_turns(objects):
-    """(user, agent) text for a Codex rollout file, newest exchange."""
-    def message(obj):
+    """Every real turn in a Codex rollout file, oldest first."""
+    turns = []
+    for obj in objects:
         payload = obj.get("payload")
         if not isinstance(payload, dict) or payload.get("type") != "message":
-            return None, ""
+            continue
+        role = payload.get("role")
         blocks = payload.get("content")
-        if not isinstance(blocks, list):
-            return None, ""
-        return payload.get("role"), " ".join(
-            block.get("text", "") for block in blocks if isinstance(block, dict))
+        if role not in ("user", "assistant") or not isinstance(blocks, list):
+            continue
+        text = _clean_turn_text(" ".join(
+            block.get("text", "") for block in blocks
+            if isinstance(block, dict)))
+        if text:
+            turns.append(("user" if role == "user" else "agent", text))
+    return turns
 
-    user, agent = "", ""
-    for index in range(len(objects) - 1, -1, -1):
-        role, text = message(objects[index])
-        if role != "user":
+
+def tail_exchange(turns):
+    """The last answered exchange, plus a trailing prompt still unanswered.
+
+    Showing only the newest prompt and its reply reads as nothing at all when
+    the newest prompt has no reply yet — a pane parked mid-turn, or one where
+    the last thing typed was `test`, says `you test` and stops. The answered
+    exchange behind it is the part that identifies the pane, and the unanswered
+    prompt on the end is what the agent was about to do, so both are shown.
+    """
+    trailing = []
+    if turns and turns[-1][0] == "user":
+        trailing = [turns[-1]]
+        turns = turns[:-1]
+    for index in range(len(turns) - 1, -1, -1):
+        if turns[index][0] != "agent":
             continue
-        text = _clean_turn_text(text)
-        if not text:
-            continue
-        user = text
-        for later in objects[index + 1:]:
-            role, said = message(later)
-            if role == "assistant":
-                said = _clean_turn_text(said)
-                if said:
-                    agent = said
-        break
-    if not user:
-        for obj in reversed(objects):
-            role, said = message(obj)
-            if role == "assistant":
-                said = _clean_turn_text(said)
-                if said:
-                    agent = said
-                    break
-    return user, agent
+        prompt = next((turn for turn in reversed(turns[:index])
+                       if turn[0] == "user"), None)
+        return ([prompt] if prompt else []) + [turns[index]] + trailing
+    return trailing
 
 
 # Registered after definition: AGENTS is declared at the top of the file as the
@@ -631,42 +606,46 @@ AGENTS["codex"]["turn_reader"] = _codex_turns
 
 
 def last_exchange(uuid, agent="claude"):
-    """(user, agent) text of the newest exchange in a session, both possibly ''.
+    """[(role, text)] for the tail of a session's conversation, possibly empty.
 
-    Only the MAIN transcript is read. Sub-agent transcripts (activity_globs)
-    are deliberately excluded: what the supervisor wants to recognise is their
-    own conversation, not a worker's.
+    Roles are "user" and "agent". Only the MAIN transcript is read: sub-agent
+    transcripts (activity_globs) are deliberately excluded, because what the
+    supervisor wants to recognise is their own conversation, not a worker's.
     """
     spec = AGENTS.get(agent) or {}
     reader = spec.get("turn_reader")
     if reader is None:
-        return "", ""
+        return []
     paths = glob.glob(spec["transcript_glob"].format(sid=uuid))
     if not paths:
-        return "", ""
+        return []
     try:
         newest = max(paths, key=os.path.getmtime)
     except OSError:
-        return "", ""
+        return []
     try:
-        user, said = reader(_tail_objects(newest))
-        if not user:
-            # Hundreds of tool results can bury the prompt. Widening once is
-            # far cheaper than reading every transcript at this size always.
+        turns = tail_exchange(reader(_tail_objects(newest)))
+        if not {"user", "agent"} <= {role for role, _ in turns}:
+            # A long tool-heavy stretch buries the conversation: a 27MB Codex
+            # rollout here had exactly one real turn in its last megabyte. The
+            # trigger is a missing REPLY rather than a missing prompt, because
+            # a lone unanswered prompt is precisely the useless case. Widening
+            # once is far cheaper than reading every transcript at this size.
             try:
                 oversized = os.path.getsize(newest) > EXCERPT_TAIL_BYTES
             except OSError:
                 oversized = False
             if oversized:
-                wider = reader(_tail_objects(newest, EXCERPT_WIDE_TAIL_BYTES))
-                if wider[0] or wider[1]:
-                    user, said = wider
+                wider = tail_exchange(
+                    reader(_tail_objects(newest, EXCERPT_WIDE_TAIL_BYTES)))
+                if wider:
+                    turns = wider
     except Exception:  # a transcript schema change must never block a stub
-        return "", ""
-    # Returned whole. Shortening the reply is the display's business, and by
+        return []
+    # Returned whole. Shortening a turn is the display's business, and by
     # default the display does not shorten it either: a half-quoted answer is
     # exactly the thing that sends you back into the pane to read the rest.
-    return user, said
+    return turns
 
 
 
@@ -1111,13 +1090,25 @@ _hb_reset_terminal() {{
 }}
 # The excerpt is wrapped here, not when the file was written: a pane can be
 # resized (or the stub read on a different screen) long after hibernation.
-_hb_turn() {{  # $1 speaker, $2 text, $3 max lines (0 = all), $4 label column
-    [ -z "$2" ] && return 0
-    local cols width wrapped shown=0 line
+_hb_cols() {{
+    local cols
     cols=$(tput cols 2>/dev/null) || cols=""
     [ -z "$cols" ] && cols=${{COLUMNS:-80}}
     case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
-    width=$(( cols - $4 - 4 ))
+    printf '%s' "$cols"
+}}
+_hb_fold() {{  # $1 colour prefix, $2 text — wrapped to the full pane width
+    local width=$(( $(_hb_cols) - 1 )) line
+    [ "$width" -lt 30 ] && width=30
+    printf '%s\\n' "$2" | fold -s -w "$width" 2>/dev/null | while IFS= read -r line
+    do
+        printf '%b%s\\033[0m\\n' "$1" "$line"  # %b so the colour is a colour
+    done
+}}
+_hb_turn() {{  # $1 speaker, $2 text, $3 max lines (0 = all), $4 label column
+    [ -z "$2" ] && return 0
+    local width wrapped shown=0 line
+    width=$(( $(_hb_cols) - $4 - 4 ))
     [ "$width" -lt 30 ] && width=30
     wrapped=$(printf '%s\n' "$2" | fold -s -w "$width" 2>/dev/null) || wrapped=$2
     while IFS= read -r line; do
@@ -1149,11 +1140,11 @@ _hb_stub() {{
     # banner above it would be scrolled off the screen by the very thing it is
     # introducing — and "press Enter to resume" is the one line that has to
     # still be visible next to the cursor.
-    [ -n {excerpt_any} ] && printf '\\n'
-    _hb_turn 'you' {excerpt_user} {excerpt_lines} {excerpt_pad}
-    _hb_turn {excerpt_label} {excerpt_agent} {excerpt_lines} {excerpt_pad}
-    printf '\\n\\033[1;35m%s\\033[0m\\n' {banner}
-    printf '\\033[2m%s\\033[0m\\n\\n' {subtitle}
+    {excerpt}
+    printf '\\n'
+    _hb_fold '\\033[1;35m' {banner}
+    _hb_fold '\\033[2m' {subtitle}
+    printf '\\n'
     IFS= read -r _ || return 0
     printf 'resuming session %s (takes 10-20s)...\\n' {uuid}
     {tool} label-awake {pane_id} >/dev/null 2>&1
@@ -1213,14 +1204,14 @@ def write_stub_file(pane_id, rec):
     os.makedirs(PANES_DIR, mode=0o700, exist_ok=True)
     banner = "💤 hibernated %s ago (freed ~%dMB) — press Enter to resume" % (
         since_str(rec.get("at", "")), rec.get("freed_mb", 0))
-    subtitle = "session %s · %s · Ctrl-C for a plain shell" % (
-        rec["uuid"], rec.get("cwd", ""))
     agent = rec.get("agent", "claude")
+    # Short id and a ~-relative path: the full uuid wrapped this line onto a
+    # third row for no gain, and Ctrl-C prints the exact resume command anyway.
+    subtitle = "%s %s · %s · Ctrl-C for a plain shell" % (
+        agent, rec["uuid"].split("-")[0], tilde(rec.get("cwd", "")))
     # Re-read on every rewrite (the watcher rewrites each stub every scan) so a
     # session that kept talking before it was parked shows its real last words.
-    user, said = ("", "")
-    if _excerpt_shown:
-        user, said = last_exchange(rec["uuid"], agent)
+    turns = last_exchange(rec["uuid"], agent) if _excerpt_shown else []
     # Both speakers share one label column, so a long Herdr agent name would
     # otherwise push the reply's text out of line with the prompt's.
     label = (rec.get("agent_name") or agent)[:10]
@@ -1234,12 +1225,7 @@ def write_stub_file(pane_id, rec):
         cwd=shlex.quote(rec.get("cwd") or os.path.expanduser("~")),
         banner=shlex.quote(banner),
         subtitle=shlex.quote(subtitle),
-        excerpt_user=shlex.quote(user),
-        excerpt_agent=shlex.quote(said),
-        excerpt_label=shlex.quote(label),
-        excerpt_pad=str(max(3, len(label))),
-        excerpt_lines=str(_excerpt_lines),  # 0 = print the turn in full
-        excerpt_any=shlex.quote("1" if (user or said) else ""),
+        excerpt=render_excerpt(turns, label),
         tool=shlex.quote(SELF),
     )
     tmp = path + ".tmp"
@@ -1250,6 +1236,24 @@ def write_stub_file(pane_id, rec):
     os.chmod(tmp, 0o700)
     os.replace(tmp, path)
     return path
+
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home) else path
+
+
+def render_excerpt(turns, label):
+    """The shell lines that print an excerpt, ready to drop into the stub."""
+    if not turns:
+        return ":"  # nothing to say; keep the template a valid statement
+    pad = str(max(3, len(label)))
+    lines = ["printf '\\n'"]
+    for role, text in turns:
+        lines.append("_hb_turn %s %s %s %s" % (
+            shlex.quote("you" if role == "user" else label),
+            shlex.quote(text), _excerpt_lines, pad))
+    return "\n    ".join(lines)
 
 
 def remove_stub_file(pane_id):

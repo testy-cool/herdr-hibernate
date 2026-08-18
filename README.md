@@ -307,13 +307,19 @@ above the banner:
   you    can you check why the staging promo codes 404
   claude The 404 comes from the rewrite rule in vercel.json. I changed the
          source pattern and pushed, but the deploy has not finished yet.
+  you    test
 
 💤 hibernated 31m ago (freed ~717MB) — press Enter to resume
-session 12219271 · ~/Work/try-rs/promo-tester-staging
+claude 12219271 · ~/Work/try-rs/promo-tester-staging · Ctrl-C for a plain shell
 ```
 
 Enough to know what the pane was doing without resuming it, which is the point.
 
+- **The last answered exchange, plus any prompt still unanswered.** Showing
+  only the newest prompt and its reply says nothing at all when the newest
+  prompt has no reply — a pane parked mid-turn, or one where the last thing
+  typed was `test`, would read `you test` and stop. The answered exchange
+  behind it is what identifies the pane.
 - **Both turns are printed in full.** A reply cut off after a few lines is the
   thing that sends you back into the pane to read the rest, which is exactly
   what this is here to avoid. Set `EXCERPT_LINES` to a number if you would
@@ -326,7 +332,12 @@ Enough to know what the pane was doing without resuming it, which is the point.
   *after* the prompt, never backwards from the end of the file, so you are
   never shown the previous turn's answer as though it were this one's.
 - Slash commands, hook output, task notifications and sub-agent turns are not
-  the human talking, and are skipped.
+  the human talking, and are skipped. Codex's memory-citation markup and
+  markdown link targets are dropped from replies for the same reason: they are
+  longer than some answers and carry nothing at a glance.
+- A long tool-heavy stretch can bury the conversation past the read window — a
+  27MB Codex rollout here had one real turn in its last megabyte — so the
+  window is widened once when the exchange comes back incomplete.
 - Grok panes get no excerpt yet — its transcript schema is unverified here, and
   a wrong excerpt is worse than none.
 
