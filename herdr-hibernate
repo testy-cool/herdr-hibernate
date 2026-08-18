@@ -157,11 +157,12 @@ CONFIG_KEYS = [
      "(a monitor, `herdr wait`, a build) and is never hibernated while that\n"
      "child runs. Startup-time children (MCP servers, helpers) are older than\n"
      "this gap and don't count. 0 disables the check."),
-    ("EXCERPT_LINES", "4",
-     "Reprint the last exchange (your prompt and the reply) above the resume\n"
+    ("EXCERPT_LINES", "all",
+     "Reprint the last exchange (your prompt and the reply) below the resume\n"
      "banner, dimmed, so a parked pane says what it was doing without being\n"
-     "resumed. The agent's reply is capped at this many wrapped lines; your\n"
-     "prompt gets half as many. 0 hides the excerpt entirely.\n"
+     "resumed. `all` prints both turns in full — nothing is cut. A number caps\n"
+     "each turn at that many wrapped lines instead, marking the cut with `…`.\n"
+     "0 hides the excerpt entirely.\n"
      "NOTE: this puts conversation text in ~/.config/herdr-hibernate/panes/,\n"
      "which is why those scripts are owner-only."),
     ("BUSY_IGNORE_TOKENS", '"mcp"',
@@ -180,7 +181,12 @@ DEFAULTS["PINNED_TABS"] = ""
 # ---------------------------------------------------------------- utilities
 
 _log_max_bytes = 512 * 1024  # updated from LOG_MAX_KB by load_config()
-_excerpt_lines = 4  # updated from EXCERPT_LINES by load_config()
+# Updated from EXCERPT_LINES by load_config(). Two values, because "print the
+# whole reply" and "print no reply at all" are both things you can ask for:
+# _excerpt_shown is whether to print an excerpt, _excerpt_lines is the per-turn
+# line cap with 0 meaning uncapped.
+_excerpt_shown = True
+_excerpt_lines = 0
 
 
 def rotate_log():
@@ -235,18 +241,27 @@ def load_config():
         with open(CONFIG_FILE, "a", encoding="utf-8") as fh:
             fh.write("".join(missing))
 
-    global _log_max_bytes, _excerpt_lines
+    global _log_max_bytes, _excerpt_shown, _excerpt_lines
     try:
         _log_max_bytes = int(float(cfg["LOG_MAX_KB"]) * 1024)
     except (ValueError, KeyError):
         pass
     # A global rather than a parameter because write_stub_file is reached from
     # five call sites that have no config in hand — same reason as the log cap.
-    try:
-        _excerpt_lines = max(0, int(float(cfg["EXCERPT_LINES"])))
-    except (ValueError, KeyError):
-        pass
+    _excerpt_shown, _excerpt_lines = _parse_excerpt_lines(cfg.get("EXCERPT_LINES"))
     return cfg
+
+
+def _parse_excerpt_lines(raw):
+    """(show the excerpt?, per-turn line cap with 0 = uncapped)."""
+    word = str(raw if raw is not None else "all").strip().strip('"\'').lower()
+    if word in ("all", "full", "-1"):
+        return True, 0
+    try:
+        count = int(float(word))
+    except ValueError:
+        return True, 0  # an unreadable setting must not silently hide anything
+    return (count > 0), max(0, count)
 
 
 _herdr_bin = None
@@ -437,8 +452,6 @@ def transcript_age_minutes(uuid, agent="claude"):
 
 EXCERPT_TAIL_BYTES = 1024 * 1024
 EXCERPT_WIDE_TAIL_BYTES = 12 * 1024 * 1024
-EXCERPT_USER_CHARS = 320
-EXCERPT_AGENT_CHARS = 1400
 
 # Pseudo-user entries: hooks, slash-command wrappers, background task results
 # and skill injections all arrive as role "user". None of them is something the
@@ -642,14 +655,10 @@ def last_exchange(uuid, agent="claude"):
                     user, said = wider
     except Exception:  # a transcript schema change must never block a stub
         return "", ""
-    return _ellipsize(user, EXCERPT_USER_CHARS), _ellipsize(said, EXCERPT_AGENT_CHARS)
-
-
-def _ellipsize(text, limit):
-    if len(text) <= limit:
-        return text
-    cut = text[:limit].rsplit(" ", 1)[0]
-    return (cut or text[:limit]) + " …"
+    # Returned whole. Shortening the reply is the display's business, and by
+    # default the display does not shorten it either: a half-quoted answer is
+    # exactly the thing that sends you back into the pane to read the rest.
+    return user, said
 
 
 
@@ -1080,11 +1089,15 @@ _hb_stub() {{
     export HERDR_HIBERNATE_STUB=1
     _hb_reset_terminal
     cd {cwd} 2>/dev/null || cd "$HOME" || return 0
+    # Excerpt first, banner last. The reply is printed whole by default, so a
+    # banner above it would be scrolled off the screen by the very thing it is
+    # introducing — and "press Enter to resume" is the one line that has to
+    # still be visible next to the cursor.
+    [ -n {excerpt_any} ] && printf '\\n'
+    _hb_turn 'you' {excerpt_user} {excerpt_lines} {excerpt_pad}
+    _hb_turn {excerpt_label} {excerpt_agent} {excerpt_lines} {excerpt_pad}
     printf '\\n\\033[1;35m%s\\033[0m\\n' {banner}
     printf '\\033[2m%s\\033[0m\\n\\n' {subtitle}
-    _hb_turn 'you' {excerpt_user} {excerpt_user_lines} {excerpt_pad}
-    _hb_turn {excerpt_label} {excerpt_agent} {excerpt_agent_lines} {excerpt_pad}
-    [ -n {excerpt_any} ] && printf '\\n'
     IFS= read -r _ || return 0
     printf 'resuming session %s (takes 10-20s)...\\n' {uuid}
     {tool} label-awake {pane_id} >/dev/null 2>&1
@@ -1150,7 +1163,7 @@ def write_stub_file(pane_id, rec):
     # Re-read on every rewrite (the watcher rewrites each stub every scan) so a
     # session that kept talking before it was parked shows its real last words.
     user, said = ("", "")
-    if _excerpt_lines > 0:
+    if _excerpt_shown:
         user, said = last_exchange(rec["uuid"], agent)
     # Both speakers share one label column, so a long Herdr agent name would
     # otherwise push the reply's text out of line with the prompt's.
@@ -1169,10 +1182,7 @@ def write_stub_file(pane_id, rec):
         excerpt_agent=shlex.quote(said),
         excerpt_label=shlex.quote(label),
         excerpt_pad=str(max(3, len(label))),
-        # The prompt is usually one thought and the reply is the substance, so
-        # the reply gets the full budget and the prompt half of it.
-        excerpt_user_lines=str(max(1, _excerpt_lines // 2)),
-        excerpt_agent_lines=str(_excerpt_lines),
+        excerpt_lines=str(_excerpt_lines),  # 0 = print the turn in full
         excerpt_any=shlex.quote("1" if (user or said) else ""),
         tool=shlex.quote(SELF),
     )

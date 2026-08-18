@@ -823,15 +823,15 @@ class LastExchangeTests(unittest.TestCase):
                 self.assertEqual(hibernate.last_exchange("sid", "claude"),
                                  ("buried but reachable", "the answer"))
 
-    def test_long_turns_are_ellipsized_not_dumped(self):
+    def test_turns_are_returned_whole(self):
+        """Shortening is the display's business, and it does not shorten either."""
         with self.write("claude", "sid", [
             self.claude_user("word " * 400),
             self.claude_agent("reply " * 900),
         ]):
             user, said = hibernate.last_exchange("sid", "claude")
-        self.assertLessEqual(len(user), hibernate.EXCERPT_USER_CHARS + 2)
-        self.assertLessEqual(len(said), hibernate.EXCERPT_AGENT_CHARS + 2)
-        self.assertTrue(user.endswith("…") and said.endswith("…"))
+        self.assertEqual(user, ("word " * 400).strip())
+        self.assertEqual(said, ("reply " * 900).strip())
 
     def test_an_agent_without_a_reader_yields_no_excerpt(self):
         """Grok has no verified reader yet; that must degrade, not raise."""
@@ -884,16 +884,17 @@ class StubExcerptTests(unittest.TestCase):
                              env=dict(os.environ, COLUMNS=columns, TERM="dumb"))
         return path, run.stdout
 
-    def test_the_last_exchange_is_printed_above_the_prompt(self):
+    def test_the_last_exchange_is_printed_above_the_banner(self):
+        """The banner has to end up next to the cursor, under the excerpt."""
         _, out = self.render("why is staging 404ing",
                              "The rewrite rule was wrong. Pushed a fix.")
 
         self.assertIn("you", out)
-        self.assertIn("why is staging 404ing", out)
         self.assertIn("claude", out)
-        self.assertIn("The rewrite rule was wrong.", out)
-        self.assertLess(out.index("hibernated"), out.index("why is staging"))
-        self.assertLess(out.index("why is staging"), out.index("rewrite rule"))
+        self.assertLess(out.index("why is staging 404ing"),
+                        out.index("The rewrite rule was wrong."))
+        self.assertLess(out.index("The rewrite rule was wrong."),
+                        out.index("press Enter to resume"))
 
     def test_the_excerpt_is_dim(self):
         """Dim is the whole point: present, but not competing with live output."""
@@ -911,23 +912,42 @@ class StubExcerptTests(unittest.TestCase):
         self.assertIn("$(id)", out)
         self.assertIn("$(hostname)", out)
 
-    def test_a_long_reply_is_capped_and_marked(self):
+    def test_a_long_reply_is_printed_whole_by_default(self):
+        """No cut, no ellipsis: a half-quoted answer sends you into the pane."""
+        reply = " ".join("sentence%d" % n for n in range(400))
+        _, out = self.render("short", reply)
+
+        plain = ANSI_RE.sub("", out)
+        self.assertNotIn("…", plain)
+        for word in ("sentence0", "sentence200", "sentence399"):
+            self.assertIn(word, plain)
+        self.assertGreater(len([line for line in plain.splitlines()
+                                if "sentence" in line]), 10)
+
+    def test_a_numeric_setting_still_caps_and_marks_the_cut(self):
         with mock.patch.object(hibernate, "_excerpt_lines", 3):
             _, out = self.render("short", "word " * 400)
 
-        body = [line for line in out.splitlines() if line.strip()]
-        reply = [line for line in body if "word" in line]
+        reply = [line for line in out.splitlines() if "word" in line]
         self.assertEqual(len(reply), 3)
         self.assertIn("…", out)
 
-    def test_zero_lines_hides_the_excerpt_entirely(self):
-        with mock.patch.object(hibernate, "_excerpt_lines", 0):
+    def test_zero_hides_the_excerpt_entirely(self):
+        with mock.patch.object(hibernate, "_excerpt_shown", False):
             with mock.patch.object(hibernate, "last_exchange") as reader:
                 path = hibernate.write_stub_file("w1:p1", self.rec)
         reader.assert_not_called()
         with open(path, encoding="utf-8") as fh:
             body = fh.read()
         self.assertIn("_hb_turn 'you' '' ", body)
+
+    def test_excerpt_lines_settings_map_to_show_and_cap(self):
+        self.assertEqual(hibernate._parse_excerpt_lines("all"), (True, 0))
+        self.assertEqual(hibernate._parse_excerpt_lines("6"), (True, 6))
+        self.assertEqual(hibernate._parse_excerpt_lines("0"), (False, 0))
+        # A typo must not silently swallow the conversation.
+        self.assertEqual(hibernate._parse_excerpt_lines("yes please"), (True, 0))
+        self.assertEqual(hibernate._parse_excerpt_lines(None), (True, 0))
 
     def test_a_session_with_no_readable_exchange_prints_only_the_banner(self):
         _, out = self.render("", "")

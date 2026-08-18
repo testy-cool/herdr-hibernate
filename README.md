@@ -171,7 +171,7 @@ take effect without a restart.
 
 | `FORGET_AFTER_MINUTES` | `15` | Grace period before a vanished pane's data is erased. `0` = erase on first sight. |
 | `LOG_MAX_KB` | `512` | Rotate the log past this size (one backup kept). |
-| `EXCERPT_LINES` | `4` | Wrapped lines of the agent's last reply reprinted above the banner (your prompt gets half as many). `0` hides the excerpt. |
+| `EXCERPT_LINES` | `all` | `all` reprints the last exchange in full. A number caps each turn at that many wrapped lines, marking the cut with `…`. `0` hides the excerpt. |
 | `BUSY_CHILD_MINUTES` | `3` | A child process started this many minutes after its agent marks the pane as running a background job — never hibernated while it lives. `0` disables. |
 | `BUSY_IGNORE_TOKENS` | `mcp` | Space-separated case-insensitive substrings; matching child processes are ignored by the background-job check. |
 
@@ -286,9 +286,8 @@ wake-up always lands before the pane can qualify.
 4. The record is written to `state.json` **and** a stub script is written to
    `panes/<pane_id>.sh` — both before anything is started, so a crash mid-way
    still leaves the pane recoverable.
-5. That script is started in the pane's shell:
-   `💤 hibernated 2h14m ago (freed ~880MB) — press Enter to resume`,
-   followed by the last exchange (see below).
+5. That script is started in the pane's shell: the last exchange (see below),
+   then `💤 hibernated 2h14m ago (freed ~880MB) — press Enter to resume`.
    It is one small bash process waiting on stdin.
 6. The tab is renamed `💤 <old label>` so hibernated tabs are obvious.
 
@@ -301,19 +300,25 @@ gone — that is the terminal's doing, not this tool's, and it happens just the
 same when you quit an agent by hand. There is no scrollback left to keep.
 
 So the stub reprints the tail of the conversation from the transcript, dimmed,
-under the banner:
+above the banner:
 
 ```
-💤 hibernated 31m ago (freed ~717MB) — press Enter to resume
-session 12219271 · ~/Work/try-rs/promo-tester-staging
-
   you    can you check why the staging promo codes 404
   claude The 404 comes from the rewrite rule in vercel.json. I changed the
          source pattern and pushed, but the deploy has not finished yet.
+
+💤 hibernated 31m ago (freed ~717MB) — press Enter to resume
+session 12219271 · ~/Work/try-rs/promo-tester-staging
 ```
 
-Enough to recognise the pane without resuming it, which is the whole point.
+Enough to know what the pane was doing without resuming it, which is the point.
 
+- **Both turns are printed in full.** A reply cut off after a few lines is the
+  thing that sends you back into the pane to read the rest, which is exactly
+  what this is here to avoid. Set `EXCERPT_LINES` to a number if you would
+  rather have it short.
+- The banner goes *under* the excerpt so that `press Enter to resume` is next
+  to the cursor rather than scrolled off the top by a long reply.
 - Wrapping happens when the stub prints, so a pane resized after hibernation
   still lines up.
 - A session parked mid-turn shows the prompt alone. The reply is looked up
