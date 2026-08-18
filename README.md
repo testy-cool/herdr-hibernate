@@ -11,10 +11,12 @@ only when the session can be provably resumed from disk.
 
 ![A parked pane: the last exchange, then the resume banner](docs/img/parked-pane.png)
 
-That is a real parked Codex pane. The excerpt above the banner is read back
-from the session transcript, because killing an agent takes its scrollback with
-it — every supported agent draws on the terminal's alternate screen buffer, so
-the visible conversation is gone the moment the process exits.
+That is a real parked pane, asked about this repo and then parked with this
+tool — 687 MB and five processes gone, the pane and its answer still there. The
+excerpt above the banner is read back from the session transcript, because
+killing an agent takes its scrollback with it: every supported agent draws on
+the terminal's alternate screen buffer, so the visible conversation goes the
+moment the process exits.
 
 | Agent | Resume command | Typical RAM freed |
 |---|---|---|
