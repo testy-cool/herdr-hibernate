@@ -1,111 +1,83 @@
 # herdr-hibernate
 
-Auto-hibernates idle coding-agent tabs in Herdr. Each idle agent tab holds
-hundreds of MB to several GB (the agent process plus its MCP server children).
-This tool kills that process tree and leaves a tiny bash stub (a few MB) in
-the pane. Pressing Enter in the pane resumes the exact session with full
-history.
+Idle coding-agent panes in [Herdr](https://herdr.dev) hold hundreds of MB to
+several GB each — the agent process plus its MCP server children. This parks
+them: it kills the process tree, leaves a few-MB bash stub in the pane, and
+prints the conversation's last exchange so you can still tell what the pane was
+doing. Press Enter and the exact session comes back with full history.
 
-Supported agents:
+Panes and tabs are never closed. Only processes inside them are killed, and
+only when the session can be provably resumed from disk.
+
+![A parked pane: the last exchange, then the resume banner](docs/img/parked-pane.png)
+
+That is a real parked Codex pane. The excerpt above the banner is read back
+from the session transcript, because killing an agent takes its scrollback with
+it — every supported agent draws on the terminal's alternate screen buffer, so
+the visible conversation is gone the moment the process exits.
 
 | Agent | Resume command | Typical RAM freed |
 |---|---|---|
 | Claude Code | `claude --resume <uuid>` | 650–930 MB |
-| Codex CLI | `codex resume <uuid>` | ~550 MB (multi-GB after sub-agent runs) |
-| Grok (xAI Grok Build) | `grok --resume <uuid> --cwd <dir>` | ~35 MB + your MCP servers (~500 MB typical) |
+| Codex CLI | `codex resume <uuid>` | ~550 MB, multi-GB after sub-agent runs |
+| Grok (xAI Grok Build) | `grok --resume <uuid> --cwd <dir>` | ~35 MB plus your MCP servers |
 
-Only agents with a proven on-disk resume path are ever touched; anything else
-is exempt — killing a session that cannot be resumed would lose the
-conversation.
-
-Panes and tabs are **never closed** — only processes inside them are killed.
-
-Hibernation **survives a reboot**: the stub is only a process, so it dies when
-Herdr or the machine goes down, but the pane's resume instructions live on disk
-and are re-armed automatically. See [Surviving restarts](#surviving-restarts).
+Anything else is left alone. Killing a session with no proven way back would
+lose the conversation, so the tool refuses.
 
 ## Install
 
-As a [Herdr plugin](https://herdr.dev/docs/plugins) (Herdr ≥ 0.7.0, Python 3,
-no other dependencies, no build step):
+Herdr ≥ 0.7.0 and Python 3. No other dependencies, no build step.
 
 ```bash
-herdr plugin install bengemine/herdr-hibernate
+herdr plugin install testy-cool/herdr-hibernate
+herdr plugin action invoke bengemine.hibernate.install   # watcher + shell hook
 ```
 
-Then, from any Herdr-managed pane, start the background watcher and shell hook
-(re-run this after an upgrade — it refreshes the hook in place):
+Re-run the second command after an upgrade; it refreshes the shell hook in
+place. The script is self-contained, so cloning the repo and running
+`./herdr-hibernate` directly works too.
+
+**It ships in dry-run** (`DRY_RUN=1`): scans only write what they *would* do to
+`~/.config/herdr-hibernate/hibernate.log`. Read a few passes, then set
+`DRY_RUN=0` in `~/.config/herdr-hibernate/config` to arm it.
+
+Tested on Linux and WSL2. macOS is untested — the watcher's systemd path does
+not exist there and the nohup fallback has never been verified.
+
+## Use it
+
+Panes park themselves after `HIBERNATE_AFTER_MINUTES` of no transcript writes.
+Everything below is for when you want to do it yourself.
 
 ```bash
-herdr plugin action invoke bengemine.hibernate.install
+./herdr-hibernate status                    # every pane, its idle time, and the verdict
+./herdr-hibernate now                       # park the focused pane, skipping the idle wait
+./herdr-hibernate hibernate w2:p3           # park a specific pane
+./herdr-hibernate hibernate-workspace w2    # park a whole project at once
+./herdr-hibernate wake-workspace w2         # bring it all back
+./herdr-hibernate restore                   # re-arm panes whose stub died
 ```
 
-Or clone it and run the script directly — the plugin wrapper is optional, the
-executable is self-contained.
+`status` is the one to reach for when a pane refuses to park — it prints the
+reason per pane:
 
-**Platforms:** tested on Linux and WSL2. macOS is untested — the watcher's
-systemd path won't exist there, and while the nohup fallback should work, no
-one has verified it yet. Reports and PRs welcome.
-
-The first runs are **dry-run by default** (`DRY_RUN=1`): the tool only logs
-what it *would* hibernate. Review `~/.config/herdr-hibernate/hibernate.log`,
-then set `DRY_RUN=0` in the config to arm it.
-
-## Why killing the agent is safe
-
-All supported agents write their session transcript to disk continuously;
-nothing is held only in memory once the agent is idle. The only thing a kill
-can lose is in-flight work, which is why the tool only ever touches panes
-whose agent status is `idle` or `done` AND whose transcript has been quiet
-past the threshold — and re-checks the status immediately before killing.
-
-- **Claude Code**: transcript at
-  `~/.claude/projects/<project-dir>/<session-uuid>.jsonl`;
-  `claude --resume <uuid>` restores the full conversation.
-- **Codex CLI**: rollout file at
-  `~/.codex/sessions/<y>/<m>/<d>/rollout-<timestamp>-<uuid>.jsonl`;
-  `codex resume <uuid>` restores the full conversation, appends to the same
-  file, and keeps the same session id — so the mapping stays stable across
-  any number of hibernate/resume cycles. `-c`/`--model`/`--profile` flags
-  from the killed process are replayed on resume so overrides survive.
-- **Grok**: session dir at `~/.grok/sessions/<encoded-cwd>/<uuid>/`, with
-  `updates.jsonl` as the authoritative conversation log; `grok --resume
-  <uuid> --cwd <dir>` restores the full conversation. Herdr has no grok
-  integration and reports no session id, so the tool recovers it from grok's
-  own `~/.grok/active_sessions.json`, matching the pane's process pid + cwd.
-  Not restored by grok on resume (grok's design, not this tool's): background
-  tasks, plan-mode state, and staged/unstaged changes under `--restore-code`;
-  MCP servers are re-initialized from grok's config.
-
-## Usage
-
-```bash
-./herdr-hibernate scan               # one classification pass (obeys DRY_RUN)
-./herdr-hibernate status             # table: every pane, idle time, verdict
-./herdr-hibernate watch              # foreground loop, scan every SCAN_INTERVAL_SECONDS
-./herdr-hibernate restore            # re-arm hibernated panes whose stub died
-./herdr-hibernate restore --dry-run  # ...report only, change nothing
-./herdr-hibernate now                # hibernate the FOCUSED pane (what the keybinding calls)
-./herdr-hibernate hibernate w2:p3    # manual: skips idle-time threshold, keeps all safety rules
-./herdr-hibernate hibernate w2:p3 --force   # ...also skip the just-resumed + background-job guards
-./herdr-hibernate hibernate-workspace w2   # park every safe agent pane as one project
-./herdr-hibernate wake-workspace w2        # resume every parked pane in that project
-./herdr-hibernate workspace-toggle         # hibernate/wake the focused workspace
-./herdr-hibernate forget w2:p3       # drop a pane's hibernation record + stub
-./herdr-hibernate install            # shell hook + background watcher
-./herdr-hibernate uninstall          # stop + remove the background watcher
+```
+PANE                   TAB LABEL                    STATUS   IDLE    CLASSIFICATION
+w39:p2                 💤 1                          idle     -       EXEMPT — agent agy has no proven resume path
+w20:p1                 💤 1                          -        -       hibernated (stub waiting for Enter)
+w3P:p1                 1                            idle     1m      idle only 1m (< 30m threshold)
+w3R:p1                 1                            working  0m      EXEMPT — status working
 ```
 
-Run it from inside a Herdr-managed pane (`HERDR_ENV=1`) so the CLI reaches the
-session and the tool knows its own pane (which it never hibernates).
+<sub>Four rows from a real run, verbatim; the full table lists every pane.</sub>
 
-## Hibernate on demand (keybinding)
+Run these from inside a Herdr pane so the CLI can reach the session.
 
-`Ctrl-A` then `Shift-H` hibernates whatever pane is focused, right now — no
-typing, no waiting for the idle threshold.
+### Keybindings
 
-Set up in `~/.config/herdr/config.toml` (this plugin never edits your config
-for you):
+Herdr's pane menu cannot be extended by plugins, so a binding is the closest
+thing to a right-click. In `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
@@ -113,13 +85,7 @@ key = "prefix+shift+h"
 type = "plugin_action"
 command = "bengemine.hibernate.now"
 description = "hibernate focused pane"
-```
 
-Apply without restarting Herdr: `herdr server reload-config`.
-
-To toggle an entire project workspace with `Ctrl-A`, then `Shift-Z`:
-
-```toml
 [[keys.command]]
 key = "prefix+shift+z"
 type = "plugin_action"
@@ -127,330 +93,77 @@ command = "bengemine.hibernate.workspace-toggle"
 description = "hibernate or wake focused workspace"
 ```
 
-The workspace action is deliberately all-or-nothing at preflight. It refuses
-before killing anything if an agent is working, blocked, unsupported, pinned,
-or lacks a verified session; it also refuses a pane running an arbitrary
-non-agent command because that command has no proven restore path. Empty shell
-panes are left in place. A parked workspace keeps its exact Herdr tabs, panes,
-split layout, working directories, and agent names, and is marked with `💤`.
-Toggle it again
-to restore every agent pane, staggered by
-`WORKSPACE_WAKE_STAGGER_SECONDS` to avoid one large startup spike.
+`herdr server reload-config` applies it without a restart. `Ctrl-A` `Shift-H`
+then parks whatever is focused, including a session you resumed by mistake ten
+seconds ago. `Ctrl-A` `Shift-Z` toggles the whole workspace, all-or-nothing: it
+refuses before killing anything if any pane is working, blocked, pinned, or
+lacks a verified session.
 
-(If you run the script standalone instead of as a plugin, use
-`type = "shell"` with the absolute path to `herdr-hibernate now`.)
+## Never touched
 
-`now` asks Herdr which pane has focus (`herdr pane current`) rather than
-trusting `$HERDR_PANE_ID`, because a detached binding runs outside any pane. It skips the idle threshold, the just-resumed guard, and the background-job
-guard — an explicit key press is not a mistake — but keeps the guards that
-protect you: it still refuses a pinned tab, a `working`/`blocked` agent, and
-anything where killing claude would close the tab.
-
-Feedback: on success the `💤` banner appears in the pane immediately. On
-refusal you get a Herdr notification saying why, because a detached command
-has nowhere to print.
-
-**Right-click menu is not possible.** Herdr has a built-in pane menu, but its
-config exposes no way to add entries to it — the only hook for custom actions
-is `[[keys.command]]`. A keybinding is the closest thing available.
+- Agents that are `working` or `blocked`.
+- Anything with a live background job, or Claude sub-agent workers still
+  writing — a watching orchestrator looks idle but is not.
+- Tabs whose label contains `📌`. This is the durable pin; `PINNED_TABS` also
+  works but tab ids change across Herdr restarts.
+- Panes with no session id or no transcript, agents with no resume path, and
+  the pane the tool itself is running in.
 
 ## Config — `~/.config/herdr-hibernate/config`
 
-Created with defaults on first run. Plain `KEY=VALUE`, bash-sourceable.
-`watch` re-reads it every pass, so edits (including flipping `DRY_RUN`)
-take effect without a restart.
+Plain `KEY=VALUE`, re-read every scan, so edits take effect without a restart.
+New keys from an upgrade are appended with their comments; your values are
+never overwritten.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `HIBERNATE_AFTER_MINUTES` | `30` | Idle minutes (no transcript writes) before a pane qualifies. |
+| `HIBERNATE_AFTER_MINUTES` | `30` | Idle minutes before a pane qualifies. Raise above 60 if you use scheduled wake-ups. |
+| `DRY_RUN` | `1` | `1` = log only. Set `0` to arm it. |
+| `PIN_MARKER` | `📌` | Any tab or pane label containing this is never parked. |
+| `EXCERPT_LINES` | `all` | `all` reprints the last exchange in full. A number caps each turn; `0` hides it. |
 | `SCAN_INTERVAL_SECONDS` | `120` | Delay between scans in `watch` mode. |
-| `WORKSPACE_WAKE_STAGGER_SECONDS` | `1` | Delay between pane resumes during a whole-workspace wake. |
-| `PIN_MARKER` | `📌` | Any tab/pane label containing this is never hibernated. |
-| `PINNED_TABS` | *(empty)* | Space-separated tab ids, never hibernated. |
-| `DRY_RUN` | `1` | `1` = log only, touch nothing. Set `0` only after reviewing the log. |
-| `KILL_GRACE_SECONDS` | `5` | Wait after SIGTERM before SIGKILL-ing survivors. |
+| `KILL_GRACE_SECONDS` | `5` | Wait after SIGTERM before SIGKILL. |
+| `FORGET_AFTER_MINUTES` | `15` | How long a pane must be *missing* before its record is erased. |
+| `BUSY_CHILD_MINUTES` | `3` | A child started this long after its agent means a background job is running. `0` disables. |
+| `BUSY_IGNORE_TOKENS` | `mcp` | Substrings that exclude a child from that check. |
+| `WORKSPACE_WAKE_STAGGER_SECONDS` | `1` | Gap between resumes during a workspace wake. |
+| `LOG_MAX_KB` | `512` | Log rotation size, one backup kept. |
+| `PINNED_TABS` | *(empty)* | Space-separated tab ids, never parked. |
 
-| `FORGET_AFTER_MINUTES` | `15` | Grace period before a vanished pane's data is erased. `0` = erase on first sight. |
-| `LOG_MAX_KB` | `512` | Rotate the log past this size (one backup kept). |
-| `EXCERPT_LINES` | `all` | `all` reprints the last exchange in full. A number caps each turn at that many wrapped lines, marking the cut with `…`. `0` hides the excerpt. |
-| `BUSY_CHILD_MINUTES` | `3` | A child process started this many minutes after its agent marks the pane as running a background job — never hibernated while it lives. `0` disables. |
-| `BUSY_IGNORE_TOKENS` | `mcp` | Space-separated case-insensitive substrings; matching child processes are ignored by the background-job check. |
+## Your data
 
-New keys added by an upgrade are appended to your existing config file, with
-their comments and defaults — your own values are never overwritten.
+Everything the tool owns lives in `~/.config/herdr-hibernate/` and is deleted
+when the pane resumes or the tab closes — no archive, no graveyard file.
 
-## What is stored, and for how long
-
-Everything lives under `~/.config/herdr-hibernate/`:
-
-| Path | Contents | Lifetime |
-|---|---|---|
-| `state.json` | One record per **currently hibernated** pane: session uuid, tab id, cwd, label. | Deleted when the pane resumes or the tab closes. |
-| `panes/<pane_id>.sh` | That pane's stub script — what survives reboots. Holds the parked session's last exchange, so it is owner-only (`0700`). | Deleted with its record. |
-| `hibernate.log` | What the tool did. | Size-capped by `LOG_MAX_KB`, one rotation. |
-| `config` | Your settings. | Permanent (it's yours). |
-
-**Closing a tab erases it.** When a pane disappears, its record and stub script
-are deleted outright — no archive, no graveyard file. The tool never holds data
-for a tab that isn't open. Records are also erased when the session resumes,
-when the pane gets reused by another agent, or when the session transcript is
-gone (nothing left to resume).
-
-`FORGET_AFTER_MINUTES` is a safety margin, not retention: a pane must be
-*missing* that long before erasure, so a half-started Herdr reporting an
-incomplete pane list cannot wipe tabs that are actually still open. If the pane
-reappears, the pending erase is cancelled. Set it to `0` to erase on first
-sight.
-
-Stray stub scripts with no matching record are garbage-collected on every
-sweep, so a crash mid-hibernation cannot leave files behind.
-
-Not this tool's data: the conversations themselves are the agents' own
-transcripts (`~/.claude/projects/`, `~/.codex/sessions/`, `~/.grok/sessions/`).
-This tool only **reads** them — for entry timestamps to measure idle time, and
-for the last exchange it reprints — and never writes or deletes them. Their
-retention is the agent's business, not ours.
-
-The one copy it does make is that excerpt, which lands in the pane's stub
+The conversations are not its data: they are the agents' own transcripts under
+`~/.claude/projects/`, `~/.codex/sessions/` and `~/.grok/sessions/`, which it
+only ever reads. The one copy it makes is the excerpt in each pane's stub
 script. Transcripts contain whatever you pasted into them, keys included, so
-those scripts are `0700` and are deleted with their record. Set
-`EXCERPT_LINES=0` if you would rather no conversation text be copied at all.
+those scripts are `0700` and go when their record does. `EXCERPT_LINES=0` stops
+the copy being made at all.
 
-## Dry-run first (default)
+## Known limits
 
-`DRY_RUN=1` ships as the default. A scan only writes lines like
-
-```
-WOULD hibernate KB Sync (w2:p4, idle 47m, ~880MB, pid 4372)
-```
-
-to the log. Review them, then set `DRY_RUN=0` in the config to arm real
-hibernation.
-
-## Pinning
-
-Two mechanisms:
-
-1. **`PINNED_TABS`** — a list of tab ids in the config. Simple, but **tab ids
-   can change when Herdr restarts**, so a pin by id can silently detach from
-   the tab it was meant to protect.
-2. **Label marker** — put `📌` (or your `PIN_MARKER`) anywhere in the tab or
-   pane label (`herdr tab rename <tab_id> "📌 my task"`). The marker travels
-   with the label, so this is the **durable** mechanism. Prefer it for
-   anything that must survive a Herdr restart.
-
-## Watchers and orchestrators (automatic)
-
-An orchestrator that is waiting on workers *looks* idle — its own prompt is
-empty and its main transcript goes quiet — but killing it would orphan the
-workers and lose the wake-up signal they send back. Two automatic guards
-protect that case, so watchers never need manual pinning:
-
-1. **Worker activity counts as activity (claude).** While background
-   sub-agents run, claude appends to
-   `~/.claude/projects/<proj>/<sid>/subagents/*.jsonl`. Those writes count
-   toward the idle clock exactly like the main transcript, so an orchestrator
-   with live workers never reaches the idle threshold.
-2. **Background jobs pin the pane (all agents).** An idle agent whose process
-   tree contains a child that started `BUSY_CHILD_MINUTES` or more after the
-   agent itself (a background monitor, a `herdr wait`, a build) is treated as
-   waiting on that job and skipped. Startup-time children — MCP servers,
-   helpers — are as old as the agent and never trigger this; anything matching
-   `BUSY_IGNORE_TOKENS` is ignored too.
-
-One timing note for claude sessions that rely on scheduled wake-ups with no
-process or file activity at all: those timers fire within 60 minutes, so keep
-`HIBERNATE_AFTER_MINUTES` above 60 (the shipped setup uses 90) and a pending
-wake-up always lands before the pane can qualify.
-
-## What is never hibernated
-
-- Panes whose agent status is `working` or `blocked`.
-- Panes with a live background job, or (claude) live sub-agent workers — see
-  "Watchers and orchestrators" above.
-- Pinned tabs (either mechanism above).
-- The pane the reaper itself runs in.
-- Agents without a proven resume path (anything not in the table above).
-- Panes with no session uuid or no transcript file (they could not be resumed,
-  so they are never killed).
-- Panes already hibernated (stub waiting).
-
-## How hibernation works
-
-1. Idle test: agent status `idle`/`done` **and** transcript untouched for
-   `HIBERNATE_AFTER_MINUTES`.
-2. The pane's claude root process is found via `herdr pane process-info`
-   (verified against the session uuid; a uuid mismatch or an ambiguous pane
-   aborts).
-3. Status is re-checked; then the whole process tree (claude + MCP children)
-   gets SIGTERM, and SIGKILL after `KILL_GRACE_SECONDS`.
-4. The record is written to `state.json` **and** a stub script is written to
-   `panes/<pane_id>.sh` — both before anything is started, so a crash mid-way
-   still leaves the pane recoverable.
-5. That script is started in the pane's shell: the last exchange (see below),
-   then `💤 hibernated 2h14m ago (freed ~880MB) — press Enter to resume`.
-   It is one small bash process waiting on stdin.
-6. The tab is renamed `💤 <old label>` so hibernated tabs are obvious.
-
-## What a parked pane still says
-
-Killing the agent takes its conversation with it. Claude Code, Codex and Grok
-all draw on the terminal's **alternate screen buffer**, so the moment the
-process exits the emulator restores the normal buffer and every visible turn is
-gone — that is the terminal's doing, not this tool's, and it happens just the
-same when you quit an agent by hand. There is no scrollback left to keep.
-
-So the stub reprints the tail of the conversation from the transcript, dimmed,
-above the banner:
-
-```
-  you    can you check why the staging promo codes 404
-  claude The 404 comes from the rewrite rule in vercel.json. I changed the
-         source pattern and pushed, but the deploy has not finished yet.
-  you    test
-
-💤 hibernated 31m ago (freed ~717MB) — press Enter to resume
-claude 12219271 · ~/Work/try-rs/promo-tester-staging · Ctrl-C for a plain shell
-```
-
-Enough to know what the pane was doing without resuming it, which is the point.
-
-- **The last answered exchange, plus any prompt still unanswered.** Showing
-  only the newest prompt and its reply says nothing at all when the newest
-  prompt has no reply — a pane parked mid-turn, or one where the last thing
-  typed was `test`, would read `you test` and stop. The answered exchange
-  behind it is what identifies the pane.
-- **Lists and code blocks keep their shape.** One command per line, one bullet
-  per bullet. Ordinary prose is still reflowed into a paragraph, because a
-  source line break mid-sentence carries nothing and the stub rewraps to the
-  pane width anyway.
-- **Both turns are printed in full.** A reply cut off after a few lines is the
-  thing that sends you back into the pane to read the rest, which is exactly
-  what this is here to avoid. Set `EXCERPT_LINES` to a number if you would
-  rather have it short.
-- The banner goes *under* the excerpt so that `press Enter to resume` is next
-  to the cursor rather than scrolled off the top by a long reply.
-- Wrapping happens when the stub prints, so a pane resized after hibernation
-  still lines up.
-- A session parked mid-turn shows the prompt alone. The reply is looked up
-  *after* the prompt, never backwards from the end of the file, so you are
-  never shown the previous turn's answer as though it were this one's.
-- Slash commands, hook output, task notifications and sub-agent turns are not
-  the human talking, and are skipped. Codex's memory-citation markup and
-  markdown link targets are dropped from replies for the same reason: they are
-  longer than some answers and carry nothing at a glance.
-- A long tool-heavy stretch can bury the conversation past the read window — a
-  27MB Codex rollout here had one real turn in its last megabyte — so the
-  window is widened once when the exchange comes back incomplete.
-- Grok panes get no excerpt yet — its transcript schema is unverified here, and
+- A parked pane has no agent process, so it loses its Herdr status badge until
+  resumed. The `💤` tab label is the substitute.
+- Reboot recovery keys on the pane id. If Herdr renumbers panes *and* changes
+  tab ids at once, `restore` falls back to matching on label and cwd; a record
+  it cannot place is erased after `FORGET_AFTER_MINUTES`. The session survives
+  regardless — the transcript is the agent's own file.
+- On WSL2 without systemd user units, `install` starts a nohup watcher that
+  inherits the pane's Herdr environment, so re-run `install` after a Herdr
+  restart.
+- Grok panes get no excerpt yet. Its transcript schema is unverified here, and
   a wrong excerpt is worse than none.
+- A pane running more than one agent process, or an agent naming a different
+  session than expected, is refused rather than guessed at.
 
-## Changed your mind about a resume
+## More
 
-Press `Ctrl-A` `Shift-H` again. Parking a pane you have just resumed works
-immediately — the manual path already skips the idle threshold and the
-just-resumed guard, and the session id is read from the agent's own
-`--resume <uuid>` arguments during the short window before Herdr reports it
-again. Nothing has to be waited for.
+[docs/how-it-works.md](docs/how-it-works.md) covers why killing an idle agent
+is safe, what the guards actually check, how a parked pane survives a reboot,
+and how the excerpt is built.
 
-The arguments are only trusted for the first few minutes of an agent's life,
-which is all the gap there is to cover. After that a resumed session that was
-since cleared or forked would still be naming the id it started with, and
-Herdr's answer is the reliable one by then.
-
-## Resume
-
-Press Enter in the pane. The stub restores the tab label and
-`exec claude --resume <uuid>` in the pane's original cwd.
-
-- Resume takes **10–20 s** (claude startup plus MCP servers spawning).
-- The **first reply after resume is slower** than usual (cold prompt cache).
-- Herdr's claude integration re-reports the session id on its own after
-  resume; the tool notices claude is live again and clears the record and the
-  stub script on the next scan. The stub deliberately does **not** delete them
-  itself — if the resume fails, the pane stays armed and can be retried.
-- **Ctrl-C** at the banner dismisses the stub and gives you a plain shell
-  (it prints the `claude --resume <uuid>` command first, so nothing is lost).
-
-## Surviving restarts
-
-The stub is a process, so it dies with Herdr — a reboot would otherwise leave
-you with a row of `💤` tabs that are just ordinary terminals, with no memory of
-which session belonged to which tab. Three mechanisms prevent that:
-
-1. **On-disk stub script per pane** — `panes/<pane_id>.sh` holds everything
-   needed to resume: session uuid, cwd, tab id, original label. It is written
-   at hibernation time and never depends on a running process.
-2. **Shell hook** (installed by `install` into `~/.bashrc` *and* `~/.zshrc`,
-   since the pane's shell is whichever one Herdr spawns) — when Herdr spawns a
-   fresh shell in a pane, the hook checks for that pane's stub script and runs
-   it immediately. This needs no daemon, so hibernated tabs come back armed the
-   instant Herdr starts, not whenever a timer next fires:
-
-   ```bash
-   if [ -n "${HERDR_PANE_ID:-}" ] && [ -z "${HERDR_HIBERNATE_STUB:-}" ] && [[ $- == *i* ]]; then
-       _hb_stub_file="$HOME/.config/herdr-hibernate/panes/${HERDR_PANE_ID//[^A-Za-z0-9]/_}.sh"
-       [ -s "$_hb_stub_file" ] && { export HERDR_HIBERNATE_STUB=1; exec bash "$_hb_stub_file"; }
-   fi
-   ```
-
-   `HERDR_HIBERNATE_STUB` is the loop guard: a shell that came *from* a stub
-   never re-arms itself.
-
-   The same block defines `hb-arm`, which is what parking a pane *right now*
-   types into it. That text is echoed by the shell, so it is the first thing
-   you read above the sleep banner, and one word reads better than ninety
-   characters of path.
-
-   The alias is used only when the pane's shell can actually run it: the shell
-   has to be one the hook installs into, and it has to have **started after its
-   own rc was last written**. A running shell keeps the rc it read at startup,
-   so a hook installed five minutes ago is invisible to every shell already
-   open, and typing a command the shell does not know leaves the pane unarmed.
-   Otherwise the command is spelled out in full. As a second line of defence,
-   a pane found sitting at a bare shell after being armed is always re-armed
-   with the spelled-out form, so an unrunnable command can never be retyped on
-   every scan.
-3. **`restore`** — a sweep that re-arms any pane whose stub is missing. It runs
-   automatically when the watcher starts and at the top of every scan, and can
-   be run by hand at any time. It is never gated by `DRY_RUN`, because it only
-   hands a pane back the session it already lost.
-
-`restore` also repairs drift: if Herdr renumbers a pane, the record is matched
-by tab id (then by label + cwd) and re-keyed. If the pane or the transcript is
-truly gone, the record is erased — see
-[What is stored](#what-is-stored-and-for-how-long).
-
-Recovering an existing hibernated tab after a restart therefore needs nothing
-from you. To check it worked:
-
-```bash
-./herdr-hibernate status     # every hibernated pane should read [stub armed]
-```
-
-## Limitations
-
-- A hibernated pane has no agent process, so it loses its Herdr agent-status
-  badge until resumed. The `💤` tab label is the visual substitute.
-- The `.bashrc` hook is bash-only. If you switch Herdr's shell to zsh or fish,
-  port the hook to that shell's rc file or reboot recovery falls back to the
-  slower `restore` sweep.
-- Reboot recovery keys on the pane id. If Herdr ever renumbers panes *and*
-  changes tab ids at the same time, the hook cannot match — `restore` then
-  falls back to label + cwd matching. A record it still cannot place looks
-  identical to a closed tab, so it is erased after `FORGET_AFTER_MINUTES`.
-  The session itself is not lost: `claude --resume` in that directory still
-  lists it, since the transcript is Claude Code's own file.
-- On WSL2 without systemd user units, `install` starts a `nohup` watcher that
-  inherits the current pane's Herdr environment — after a Herdr restart,
-  run `install` again from a live pane.
-- Tab-id pins (`PINNED_TABS`) do not survive Herdr restarts; label-marker
-  pins do.
-- Handles Claude Code, Codex, and Grok. Other agents are exempt until they
-  have a proven resume path.
-- While Codex runs sub-agents, its parent transcript can look stale; the
-  `working` status guard (hook-driven) is what protects those panes.
-- macOS is untested (see [Install](#install)).
-- If a pane runs multiple agent processes (beyond a wrapper and its own
-  child, e.g. codex's node shim), or an agent naming a different session id
-  than expected, the tool refuses to act on it.
+This is a fork of [bengemine/herdr-hibernate](https://github.com/bengemine/herdr-hibernate),
+which has not been updated since 3 August 2026. It adds workspace hibernation,
+Codex flag preservation, and the parked-pane excerpt. MIT licensed.
