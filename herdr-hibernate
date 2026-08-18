@@ -157,6 +157,13 @@ CONFIG_KEYS = [
      "(a monitor, `herdr wait`, a build) and is never hibernated while that\n"
      "child runs. Startup-time children (MCP servers, helpers) are older than\n"
      "this gap and don't count. 0 disables the check."),
+    ("EXCERPT_LINES", "4",
+     "Reprint the last exchange (your prompt and the reply) above the resume\n"
+     "banner, dimmed, so a parked pane says what it was doing without being\n"
+     "resumed. The agent's reply is capped at this many wrapped lines; your\n"
+     "prompt gets half as many. 0 hides the excerpt entirely.\n"
+     "NOTE: this puts conversation text in ~/.config/herdr-hibernate/panes/,\n"
+     "which is why those scripts are owner-only."),
     ("BUSY_IGNORE_TOKENS", '"mcp"',
      "Space-separated case-insensitive substrings; a child process whose\n"
      "command line matches one is ignored by the background-job check."),
@@ -173,6 +180,7 @@ DEFAULTS["PINNED_TABS"] = ""
 # ---------------------------------------------------------------- utilities
 
 _log_max_bytes = 512 * 1024  # updated from LOG_MAX_KB by load_config()
+_excerpt_lines = 4  # updated from EXCERPT_LINES by load_config()
 
 
 def rotate_log():
@@ -227,9 +235,15 @@ def load_config():
         with open(CONFIG_FILE, "a", encoding="utf-8") as fh:
             fh.write("".join(missing))
 
-    global _log_max_bytes
+    global _log_max_bytes, _excerpt_lines
     try:
         _log_max_bytes = int(float(cfg["LOG_MAX_KB"]) * 1024)
+    except (ValueError, KeyError):
+        pass
+    # A global rather than a parameter because write_stub_file is reached from
+    # five call sites that have no config in hand — same reason as the log cap.
+    try:
+        _excerpt_lines = max(0, int(float(cfg["EXCERPT_LINES"])))
     except (ValueError, KeyError):
         pass
     return cfg
@@ -1030,6 +1044,27 @@ _hb_reset_terminal() {{
     # Focus reporting is what prints ^[[I/^[[O when Snipping Tool changes focus.
     printf '\\033[?1004l\\033[?2004l\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l'
 }}
+# The excerpt is wrapped here, not when the file was written: a pane can be
+# resized (or the stub read on a different screen) long after hibernation.
+_hb_turn() {{  # $1 speaker, $2 text, $3 max lines (0 = all), $4 label column
+    [ -z "$2" ] && return 0
+    local cols width wrapped shown=0 line
+    cols=$(tput cols 2>/dev/null) || cols=""
+    [ -z "$cols" ] && cols=${{COLUMNS:-80}}
+    case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
+    width=$(( cols - $4 - 4 ))
+    [ "$width" -lt 30 ] && width=30
+    wrapped=$(printf '%s\n' "$2" | fold -s -w "$width" 2>/dev/null) || wrapped=$2
+    while IFS= read -r line; do
+        if [ "$3" -gt 0 ] && [ "$shown" -ge "$3" ]; then
+            printf "  \033[2m%-$4s …\033[0m\n" ''
+            break
+        fi
+        [ "$shown" -gt 0 ] && set -- '' "$2" "$3" "$4"
+        printf "  \033[2m%-$4s %s\033[0m\n" "$1" "$line"
+        shown=$(( shown + 1 ))
+    done <<< "$wrapped"
+}}
 # This script must always run as a CHILD of the pane's shell, never replace it
 # (no `exec bash <this>`). claude then ends up a child too, so killing claude at
 # the next hibernation leaves the pane's shell alive. If claude were the pane
@@ -1047,6 +1082,9 @@ _hb_stub() {{
     cd {cwd} 2>/dev/null || cd "$HOME" || return 0
     printf '\\n\\033[1;35m%s\\033[0m\\n' {banner}
     printf '\\033[2m%s\\033[0m\\n\\n' {subtitle}
+    _hb_turn 'you' {excerpt_user} {excerpt_user_lines} {excerpt_pad}
+    _hb_turn {excerpt_label} {excerpt_agent} {excerpt_agent_lines} {excerpt_pad}
+    [ -n {excerpt_any} ] && printf '\\n'
     IFS= read -r _ || return 0
     printf 'resuming session %s (takes 10-20s)...\\n' {uuid}
     {tool} label-awake {pane_id} >/dev/null 2>&1
@@ -1103,11 +1141,20 @@ def resume_argv(rec):
 
 def write_stub_file(pane_id, rec):
     """(Re)write the pane's stub script from its state record. Returns its path."""
-    os.makedirs(PANES_DIR, exist_ok=True)
+    os.makedirs(PANES_DIR, mode=0o700, exist_ok=True)
     banner = "💤 hibernated %s ago (freed ~%dMB) — press Enter to resume" % (
         since_str(rec.get("at", "")), rec.get("freed_mb", 0))
     subtitle = "session %s · %s · Ctrl-C for a plain shell" % (
         rec["uuid"], rec.get("cwd", ""))
+    agent = rec.get("agent", "claude")
+    # Re-read on every rewrite (the watcher rewrites each stub every scan) so a
+    # session that kept talking before it was parked shows its real last words.
+    user, said = ("", "")
+    if _excerpt_lines > 0:
+        user, said = last_exchange(rec["uuid"], agent)
+    # Both speakers share one label column, so a long Herdr agent name would
+    # otherwise push the reply's text out of line with the prompt's.
+    label = (rec.get("agent_name") or agent)[:10]
     resume = resume_argv(rec)
     path = pane_file(pane_id)
     body = STUB_TEMPLATE.format(
@@ -1118,12 +1165,23 @@ def write_stub_file(pane_id, rec):
         cwd=shlex.quote(rec.get("cwd") or os.path.expanduser("~")),
         banner=shlex.quote(banner),
         subtitle=shlex.quote(subtitle),
+        excerpt_user=shlex.quote(user),
+        excerpt_agent=shlex.quote(said),
+        excerpt_label=shlex.quote(label),
+        excerpt_pad=str(max(3, len(label))),
+        # The prompt is usually one thought and the reply is the substance, so
+        # the reply gets the full budget and the prompt half of it.
+        excerpt_user_lines=str(max(1, _excerpt_lines // 2)),
+        excerpt_agent_lines=str(_excerpt_lines),
+        excerpt_any=shlex.quote("1" if (user or said) else ""),
         tool=shlex.quote(SELF),
     )
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(body)
-    os.chmod(tmp, 0o755)
+    # Owner-only: this file holds a slice of the conversation now, not just a
+    # session id, and transcripts routinely contain keys the user pasted in.
+    os.chmod(tmp, 0o700)
     os.replace(tmp, path)
     return path
 

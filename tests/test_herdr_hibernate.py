@@ -2,6 +2,8 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
+import subprocess
 import tempfile
 import time
 import unittest
@@ -838,6 +840,113 @@ class LastExchangeTests(unittest.TestCase):
 
     def test_a_missing_transcript_yields_no_excerpt(self):
         self.assertEqual(hibernate.last_exchange("nope", "claude"), ("", ""))
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+class StubExcerptTests(unittest.TestCase):
+    """Rendering the last exchange into the pane's stub script."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = self.tempdir.name
+        self.paths = mock.patch.multiple(
+            hibernate, CONFIG_DIR=self.root,
+            PANES_DIR=os.path.join(self.root, "panes"))
+        self.paths.start()
+        self.rec = {
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "agent": "claude",
+            "resume": ["claude", "--resume",
+                       "11111111-1111-1111-1111-111111111111"],
+            "cwd": "/tmp",
+            "freed_mb": 100,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def tearDown(self):
+        self.paths.stop()
+        self.tempdir.cleanup()
+
+    def render(self, user, said, columns="100", **overrides):
+        """Write a stub with a fixed excerpt and run it, returning what it printed."""
+        rec = dict(self.rec, **overrides)
+        with mock.patch.object(hibernate, "last_exchange",
+                               return_value=(user, said)):
+            path = hibernate.write_stub_file("w1:p1", rec)
+        # `bash -n` first: the excerpt is arbitrary human text interpolated into
+        # a shell script, so a quoting slip would break the pane, not the pixels.
+        syntax = subprocess.run(["bash", "-n", path], capture_output=True, text=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        run = subprocess.run(["bash", path], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True,
+                             env=dict(os.environ, COLUMNS=columns, TERM="dumb"))
+        return path, run.stdout
+
+    def test_the_last_exchange_is_printed_above_the_prompt(self):
+        _, out = self.render("why is staging 404ing",
+                             "The rewrite rule was wrong. Pushed a fix.")
+
+        self.assertIn("you", out)
+        self.assertIn("why is staging 404ing", out)
+        self.assertIn("claude", out)
+        self.assertIn("The rewrite rule was wrong.", out)
+        self.assertLess(out.index("hibernated"), out.index("why is staging"))
+        self.assertLess(out.index("why is staging"), out.index("rewrite rule"))
+
+    def test_the_excerpt_is_dim(self):
+        """Dim is the whole point: present, but not competing with live output."""
+        _, out = self.render("a question", "an answer")
+        self.assertIn("\x1b[2myou", out)
+        self.assertIn("a question\x1b[0m", out)
+
+    def test_shell_metacharacters_in_a_turn_cannot_escape(self):
+        """Transcript text is untrusted input being written into a script."""
+        nasty = "'; touch /tmp/hb-pwned; echo '$(id) `id` ${PATH} \\ \" #"
+        _, out = self.render(nasty, "and $(hostname) too")
+
+        self.assertFalse(os.path.exists("/tmp/hb-pwned"))
+        self.assertIn("touch /tmp/hb-pwned", out)
+        self.assertIn("$(id)", out)
+        self.assertIn("$(hostname)", out)
+
+    def test_a_long_reply_is_capped_and_marked(self):
+        with mock.patch.object(hibernate, "_excerpt_lines", 3):
+            _, out = self.render("short", "word " * 400)
+
+        body = [line for line in out.splitlines() if line.strip()]
+        reply = [line for line in body if "word" in line]
+        self.assertEqual(len(reply), 3)
+        self.assertIn("…", out)
+
+    def test_zero_lines_hides_the_excerpt_entirely(self):
+        with mock.patch.object(hibernate, "_excerpt_lines", 0):
+            with mock.patch.object(hibernate, "last_exchange") as reader:
+                path = hibernate.write_stub_file("w1:p1", self.rec)
+        reader.assert_not_called()
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("_hb_turn 'you' '' ", body)
+
+    def test_a_session_with_no_readable_exchange_prints_only_the_banner(self):
+        _, out = self.render("", "")
+        self.assertIn("hibernated", out)
+        self.assertNotIn("you ", out)
+
+    def test_a_long_agent_name_does_not_break_the_label_column(self):
+        _, out = self.render("QQQ", "AAA", agent_name="worker-codex")
+        plain = [ANSI_RE.sub("", line) for line in out.splitlines()]
+        columns = {line.index(word) for line, word in
+                   ((row, "QQQ") for row in plain if "QQQ" in row)}
+        columns |= {line.index("AAA") for line in plain if "AAA" in line}
+        self.assertEqual(len(columns), 1, plain)
+
+    def test_the_stub_is_owner_only(self):
+        """It holds conversation text now, and transcripts carry pasted keys."""
+        path, _ = self.render("a question", "an answer")
+        self.assertEqual(oct(os.stat(path).st_mode)[-3:], "700")
+        self.assertEqual(oct(os.stat(hibernate.PANES_DIR).st_mode)[-3:], "700")
 
 
 if __name__ == "__main__":

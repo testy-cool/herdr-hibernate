@@ -171,6 +171,7 @@ take effect without a restart.
 
 | `FORGET_AFTER_MINUTES` | `15` | Grace period before a vanished pane's data is erased. `0` = erase on first sight. |
 | `LOG_MAX_KB` | `512` | Rotate the log past this size (one backup kept). |
+| `EXCERPT_LINES` | `4` | Wrapped lines of the agent's last reply reprinted above the banner (your prompt gets half as many). `0` hides the excerpt. |
 | `BUSY_CHILD_MINUTES` | `3` | A child process started this many minutes after its agent marks the pane as running a background job — never hibernated while it lives. `0` disables. |
 | `BUSY_IGNORE_TOKENS` | `mcp` | Space-separated case-insensitive substrings; matching child processes are ignored by the background-job check. |
 
@@ -184,7 +185,7 @@ Everything lives under `~/.config/herdr-hibernate/`:
 | Path | Contents | Lifetime |
 |---|---|---|
 | `state.json` | One record per **currently hibernated** pane: session uuid, tab id, cwd, label. | Deleted when the pane resumes or the tab closes. |
-| `panes/<pane_id>.sh` | That pane's stub script — what survives reboots. | Deleted with its record. |
+| `panes/<pane_id>.sh` | That pane's stub script — what survives reboots. Holds the parked session's last exchange, so it is owner-only (`0700`). | Deleted with its record. |
 | `hibernate.log` | What the tool did. | Size-capped by `LOG_MAX_KB`, one rotation. |
 | `config` | Your settings. | Permanent (it's yours). |
 
@@ -203,10 +204,16 @@ sight.
 Stray stub scripts with no matching record are garbage-collected on every
 sweep, so a crash mid-hibernation cannot leave files behind.
 
-Not this tool's data: the conversations themselves are Claude Code's own
-transcripts under `~/.claude/projects/`. This tool only **reads** their
-timestamps to measure idle time — it never writes or deletes them, and their
-retention is Claude Code's business, not ours.
+Not this tool's data: the conversations themselves are the agents' own
+transcripts (`~/.claude/projects/`, `~/.codex/sessions/`, `~/.grok/sessions/`).
+This tool only **reads** them — for entry timestamps to measure idle time, and
+for the last exchange it reprints — and never writes or deletes them. Their
+retention is the agent's business, not ours.
+
+The one copy it does make is that excerpt, which lands in the pane's stub
+script. Transcripts contain whatever you pasted into them, keys included, so
+those scripts are `0700` and are deleted with their record. Set
+`EXCERPT_LINES=0` if you would rather no conversation text be copied at all.
 
 ## Dry-run first (default)
 
@@ -280,9 +287,42 @@ wake-up always lands before the pane can qualify.
    `panes/<pane_id>.sh` — both before anything is started, so a crash mid-way
    still leaves the pane recoverable.
 5. That script is started in the pane's shell:
-   `💤 hibernated 2h14m ago (freed ~880MB) — press Enter to resume`.
+   `💤 hibernated 2h14m ago (freed ~880MB) — press Enter to resume`,
+   followed by the last exchange (see below).
    It is one small bash process waiting on stdin.
 6. The tab is renamed `💤 <old label>` so hibernated tabs are obvious.
+
+## What a parked pane still says
+
+Killing the agent takes its conversation with it. Claude Code, Codex and Grok
+all draw on the terminal's **alternate screen buffer**, so the moment the
+process exits the emulator restores the normal buffer and every visible turn is
+gone — that is the terminal's doing, not this tool's, and it happens just the
+same when you quit an agent by hand. There is no scrollback left to keep.
+
+So the stub reprints the tail of the conversation from the transcript, dimmed,
+under the banner:
+
+```
+💤 hibernated 31m ago (freed ~717MB) — press Enter to resume
+session 12219271 · ~/Work/try-rs/promo-tester-staging
+
+  you    can you check why the staging promo codes 404
+  claude The 404 comes from the rewrite rule in vercel.json. I changed the
+         source pattern and pushed, but the deploy has not finished yet.
+```
+
+Enough to recognise the pane without resuming it, which is the whole point.
+
+- Wrapping happens when the stub prints, so a pane resized after hibernation
+  still lines up.
+- A session parked mid-turn shows the prompt alone. The reply is looked up
+  *after* the prompt, never backwards from the end of the file, so you are
+  never shown the previous turn's answer as though it were this one's.
+- Slash commands, hook output, task notifications and sub-agent turns are not
+  the human talking, and are skipped.
+- Grok panes get no excerpt yet — its transcript schema is unverified here, and
+  a wrong excerpt is worse than none.
 
 ## Resume
 
