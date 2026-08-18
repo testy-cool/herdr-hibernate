@@ -86,7 +86,7 @@ past the threshold — and re-checks the status immediately before killing.
 ./herdr-hibernate restore --dry-run  # ...report only, change nothing
 ./herdr-hibernate now                # hibernate the FOCUSED pane (what the keybinding calls)
 ./herdr-hibernate hibernate w2:p3    # manual: skips idle-time threshold, keeps all safety rules
-./herdr-hibernate hibernate w2:p3 --force   # ...also skip the just-resumed guard
+./herdr-hibernate hibernate w2:p3 --force   # ...also skip the just-resumed + background-job guards
 ./herdr-hibernate hibernate-workspace w2   # park every safe agent pane as one project
 ./herdr-hibernate wake-workspace w2        # resume every parked pane in that project
 ./herdr-hibernate workspace-toggle         # hibernate/wake the focused workspace
@@ -140,10 +140,10 @@ to restore every agent pane, staggered by
 `type = "shell"` with the absolute path to `herdr-hibernate now`.)
 
 `now` asks Herdr which pane has focus (`herdr pane current`) rather than
-trusting `$HERDR_PANE_ID`, because a detached binding runs outside any pane. It skips the idle threshold and the just-resumed guard — an
-explicit key press is not a mistake — but keeps the guards that protect you:
-it still refuses a pinned tab, a `working`/`blocked` agent, and anything where
-killing claude would close the tab.
+trusting `$HERDR_PANE_ID`, because a detached binding runs outside any pane. It skips the idle threshold, the just-resumed guard, and the background-job
+guard — an explicit key press is not a mistake — but keeps the guards that
+protect you: it still refuses a pinned tab, a `working`/`blocked` agent, and
+anything where killing claude would close the tab.
 
 Feedback: on success the `💤` banner appears in the pane immediately. On
 refusal you get a Herdr notification saying why, because a detached command
@@ -171,6 +171,8 @@ take effect without a restart.
 
 | `FORGET_AFTER_MINUTES` | `15` | Grace period before a vanished pane's data is erased. `0` = erase on first sight. |
 | `LOG_MAX_KB` | `512` | Rotate the log past this size (one backup kept). |
+| `BUSY_CHILD_MINUTES` | `3` | A child process started this many minutes after its agent marks the pane as running a background job — never hibernated while it lives. `0` disables. |
+| `BUSY_IGNORE_TOKENS` | `mcp` | Space-separated case-insensitive substrings; matching child processes are ignored by the background-job check. |
 
 New keys added by an upgrade are appended to your existing config file, with
 their comments and defaults — your own values are never overwritten.
@@ -229,9 +231,35 @@ Two mechanisms:
    with the label, so this is the **durable** mechanism. Prefer it for
    anything that must survive a Herdr restart.
 
+## Watchers and orchestrators (automatic)
+
+An orchestrator that is waiting on workers *looks* idle — its own prompt is
+empty and its main transcript goes quiet — but killing it would orphan the
+workers and lose the wake-up signal they send back. Two automatic guards
+protect that case, so watchers never need manual pinning:
+
+1. **Worker activity counts as activity (claude).** While background
+   sub-agents run, claude appends to
+   `~/.claude/projects/<proj>/<sid>/subagents/*.jsonl`. Those writes count
+   toward the idle clock exactly like the main transcript, so an orchestrator
+   with live workers never reaches the idle threshold.
+2. **Background jobs pin the pane (all agents).** An idle agent whose process
+   tree contains a child that started `BUSY_CHILD_MINUTES` or more after the
+   agent itself (a background monitor, a `herdr wait`, a build) is treated as
+   waiting on that job and skipped. Startup-time children — MCP servers,
+   helpers — are as old as the agent and never trigger this; anything matching
+   `BUSY_IGNORE_TOKENS` is ignored too.
+
+One timing note for claude sessions that rely on scheduled wake-ups with no
+process or file activity at all: those timers fire within 60 minutes, so keep
+`HIBERNATE_AFTER_MINUTES` above 60 (the shipped setup uses 90) and a pending
+wake-up always lands before the pane can qualify.
+
 ## What is never hibernated
 
 - Panes whose agent status is `working` or `blocked`.
+- Panes with a live background job, or (claude) live sub-agent workers — see
+  "Watchers and orchestrators" above.
 - Pinned tabs (either mechanism above).
 - The pane the reaper itself runs in.
 - Agents without a proven resume path (anything not in the table above).
