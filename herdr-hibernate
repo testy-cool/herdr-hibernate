@@ -47,6 +47,10 @@ OPERATION_LOCK_FILE = os.path.join(CONFIG_DIR, "operation.lock")
 SYSTEMD_UNIT = os.path.expanduser("~/.config/systemd/user/herdr-hibernate.service")
 SELF = os.path.abspath(__file__)
 SHELL_HOOK_MARK = "# >>> herdr-hibernate pane stub hook >>>"
+SHELL_HOOK_END = "# <<< herdr-hibernate pane stub hook <<<"
+# Both, not just the login shell's: Herdr can spawn either, and a pane armed
+# under one shell must still re-arm itself under the other after a reboot.
+SHELL_RC_FILES = [os.path.expanduser("~/.bashrc"), os.path.expanduser("~/.zshrc")]
 
 UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 
@@ -1210,14 +1214,42 @@ def stub_command(pane_id):
     the claude it resumes, otherwise the next hibernation closes the tab.
     """
     # This text is TYPED into the pane's shell, so the shell echoes it and the
-    # user reads it. `stty sane` earns its place there: a killed agent can leave
+    # user reads it every time a pane is parked. Prefer the one-word function
+    # the shell hook defines; fall back to spelling it out when that function
+    # is not actually in the user's rc, because an unarmed pane would be
+    # re-armed with the same missing command on every scan, forever.
+    stub = pane_file(pane_id)
+    if shell_hook_defines_arm():
+        return "%s %s" % (ARM_FUNCTION,
+                          shlex.quote(os.path.basename(stub)[:-len(".sh")]))
+    # `stty sane` is the one part worth spelling out: a killed agent can leave
     # the line discipline in raw mode, and the shell has to be able to take the
-    # command at all. The emulator-mode escapes do not — they are echoed as
-    # literal `\\033[?1004l` noise, four wrapped lines of it above the banner,
-    # to close a window a few milliseconds wide that _hb_reset_terminal closes
-    # again as the script's first statement.
-    return "stty sane 2>/dev/null || true; bash %s" % shlex.quote(
-        pane_file(pane_id))
+    # command at all.
+    return "stty sane 2>/dev/null || true; bash %s" % shlex.quote(stub)
+
+
+_arm_in_rc = None
+
+
+def shell_hook_defines_arm(rcs=None):
+    """Is the arming function actually defined in a shell rc we install into?
+
+    Checked against the rc text rather than the hook marker: a user who
+    installed an older version has the marker but not the function.
+    """
+    global _arm_in_rc
+    if _arm_in_rc is None:
+        needle = "%s()" % ARM_FUNCTION
+        _arm_in_rc = False
+        for rc in (rcs if rcs is not None else SHELL_RC_FILES):
+            try:
+                with open(rc, encoding="utf-8", errors="replace") as fh:
+                    if needle in fh.read():
+                        _arm_in_rc = True
+                        break
+            except OSError:
+                continue
+    return _arm_in_rc
 
 
 def pane_process_info(pane_id):
@@ -2058,7 +2090,21 @@ def cmd_label_awake(pane_id):
         sys.exit(1)
 
 
+# The arming command is TYPED into the pane's shell, which echoes it, so its
+# whole length is something the user has to read every time a pane is parked.
+# A function keeps that echo to one legible line.
+ARM_FUNCTION = "hb-arm"
+
 SHELL_HOOK = """%s
+# Arm this pane's hibernation stub. Herdr types `hb-arm <pane>` into the pane
+# when parking it, so the name is chosen to be short: the shell echoes it, and
+# the alternative is ninety characters of paths and escapes above the banner.
+hb-arm() {
+    local _hb_name="${1:-${HERDR_PANE_ID//[^A-Za-z0-9]/_}}"
+    # A killed agent can leave the line discipline in raw mode.
+    stty sane 2>/dev/null || true
+    HERDR_HIBERNATE_STUB=1 bash "$HOME/.config/herdr-hibernate/panes/$_hb_name.sh"
+}
 # Re-arm a hibernated agent session when Herdr spawns a fresh shell in a pane.
 # This is what makes hibernation survive a reboot: the stub process dies with
 # Herdr, but its script lives on disk and this hook runs it again.
@@ -2076,8 +2122,21 @@ fi
 """ % SHELL_HOOK_MARK
 
 
-def install_shell_hook(rc=os.path.expanduser("~/.bashrc")):
-    """Add (or refresh) the .bashrc hook that re-arms stubs in fresh shells."""
+def install_shell_hook(rcs=None):
+    """Add (or refresh) the shell hook that re-arms stubs in fresh shells.
+
+    Every rc that exists gets it, plus any that already carries the marker: a
+    pane's shell is whichever one Herdr spawned, and a hook that is only half
+    installed means arming works in one shell and not the other.
+    """
+    if rcs is None:
+        rcs = [rc for rc in SHELL_RC_FILES if os.path.exists(rc)] or SHELL_RC_FILES
+    global _arm_in_rc
+    _arm_in_rc = None  # the answer changes underneath us right here
+    return "; ".join(_install_shell_hook_in(rc) for rc in rcs)
+
+
+def _install_shell_hook_in(rc):
     try:
         with open(rc, encoding="utf-8") as fh:
             body = fh.read()
@@ -2085,7 +2144,7 @@ def install_shell_hook(rc=os.path.expanduser("~/.bashrc")):
         body = ""
     if SHELL_HOOK_MARK in body:
         start = body.index(SHELL_HOOK_MARK)
-        end = body.index("# <<< herdr-hibernate pane stub hook <<<", start)
+        end = body.index(SHELL_HOOK_END, start)
         end = body.index("\n", end) + 1
         if body[start:end] == SHELL_HOOK:
             return "shell hook already installed in %s" % rc

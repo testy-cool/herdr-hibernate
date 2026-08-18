@@ -571,6 +571,64 @@ class HibernateTests(unittest.TestCase):
         self.assertNotIn("\\033[", command)
         self.assertLessEqual(len(command.splitlines()), 1)
 
+    def test_arm_command_is_one_word_when_the_shell_hook_defines_it(self):
+        rc = os.path.join(self.tempdir.name, "rc")
+        with open(rc, "w", encoding="utf-8") as fh:
+            fh.write(hibernate.SHELL_HOOK)
+        with mock.patch.object(hibernate, "SHELL_RC_FILES", [rc]), \
+                mock.patch.object(hibernate, "_arm_in_rc", None):
+            command = hibernate.stub_command("w1:p1")
+
+        self.assertEqual(command, "hb-arm w1_p1")
+
+    def test_arm_command_spells_itself_out_when_the_hook_is_stale(self):
+        """An older hook has the marker but not the function."""
+        rc = os.path.join(self.tempdir.name, "rc")
+        with open(rc, "w", encoding="utf-8") as fh:
+            fh.write(hibernate.SHELL_HOOK_MARK + "\nold hook\n"
+                     + hibernate.SHELL_HOOK_END + "\n")
+        with mock.patch.object(hibernate, "SHELL_RC_FILES", [rc]), \
+                mock.patch.object(hibernate, "_arm_in_rc", None):
+            command = hibernate.stub_command("w1:p1")
+
+        self.assertIn("bash ", command)
+        self.assertNotIn("hb-arm", command)
+
+    def test_the_hook_function_runs_the_right_stub(self):
+        """The shell has to agree with pane_file() about the name."""
+        stub = hibernate.pane_file("w1:p1")
+        os.makedirs(os.path.dirname(stub), exist_ok=True)
+        with open(stub, "w", encoding="utf-8") as fh:
+            fh.write("echo armed:$HERDR_HIBERNATE_STUB\n")
+        script = "%s\n%s\n" % (
+            hibernate.SHELL_HOOK.replace(
+                "$HOME/.config/herdr-hibernate/panes",
+                os.path.dirname(stub)),
+            hibernate.stub_command("w1:p1"))
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                run = subprocess.run(
+                    [shell, "-c", script], capture_output=True, text=True,
+                    env=dict(os.environ, HERDR_PANE_ID="w1:p1"))
+                self.assertEqual(run.stdout.strip(), "armed:1", run.stderr)
+
+    def test_install_writes_the_hook_to_every_shell_rc(self):
+        rcs = [os.path.join(self.tempdir.name, name)
+               for name in ("bashrc", "zshrc")]
+        for rc in rcs:
+            with open(rc, "w", encoding="utf-8") as fh:
+                fh.write("export EXISTING=1\n")
+        hibernate.install_shell_hook(rcs)
+        for rc in rcs:
+            with open(rc, encoding="utf-8") as fh:
+                body = fh.read()
+            self.assertIn("export EXISTING=1", body)
+            self.assertIn("hb-arm()", body)
+        # Idempotent: a second pass must not stack a second copy.
+        hibernate.install_shell_hook(rcs)
+        with open(rcs[0], encoding="utf-8") as fh:
+            self.assertEqual(fh.read().count(hibernate.SHELL_HOOK_MARK), 1)
+
     def test_the_stub_itself_still_resets_the_emulator_modes(self):
         """Which is why the arm command does not have to."""
         rec = {

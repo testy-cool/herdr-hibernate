@@ -33,7 +33,8 @@ no other dependencies, no build step):
 herdr plugin install bengemine/herdr-hibernate
 ```
 
-Then, from any Herdr-managed pane, start the background watcher and shell hook:
+Then, from any Herdr-managed pane, start the background watcher and shell hook
+(re-run this after an upgrade — it refreshes the hook in place):
 
 ```bash
 herdr plugin action invoke bengemine.hibernate.install
@@ -352,9 +353,10 @@ which session belonged to which tab. Three mechanisms prevent that:
 1. **On-disk stub script per pane** — `panes/<pane_id>.sh` holds everything
    needed to resume: session uuid, cwd, tab id, original label. It is written
    at hibernation time and never depends on a running process.
-2. **`.bashrc` hook** (installed by `install`) — when Herdr spawns a fresh
-   shell in a pane, the hook checks for that pane's stub script and `exec`s it
-   immediately. This needs no daemon, so hibernated tabs come back armed the
+2. **Shell hook** (installed by `install` into `~/.bashrc` *and* `~/.zshrc`,
+   since the pane's shell is whichever one Herdr spawns) — when Herdr spawns a
+   fresh shell in a pane, the hook checks for that pane's stub script and runs
+   it immediately. This needs no daemon, so hibernated tabs come back armed the
    instant Herdr starts, not whenever a timer next fires:
 
    ```bash
@@ -366,6 +368,13 @@ which session belonged to which tab. Three mechanisms prevent that:
 
    `HERDR_HIBERNATE_STUB` is the loop guard: a shell that came *from* a stub
    never re-arms itself.
+
+   The same block defines `hb-arm`, which is what parking a pane *right now*
+   types into it. That text is echoed by the shell, so it is the first thing
+   you read above the sleep banner, and one word reads better than ninety
+   characters of path. If the function is not in your rc — an older hook, say —
+   the tool spells the command out instead rather than typing something the
+   shell cannot run.
 3. **`restore`** — a sweep that re-arms any pane whose stub is missing. It runs
    automatically when the watcher starts and at the top of every scan, and can
    be run by hand at any time. It is never gated by `DRY_RUN`, because it only
