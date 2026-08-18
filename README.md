@@ -372,9 +372,17 @@ which session belonged to which tab. Three mechanisms prevent that:
    The same block defines `hb-arm`, which is what parking a pane *right now*
    types into it. That text is echoed by the shell, so it is the first thing
    you read above the sleep banner, and one word reads better than ninety
-   characters of path. If the function is not in your rc — an older hook, say —
-   the tool spells the command out instead rather than typing something the
-   shell cannot run.
+   characters of path.
+
+   The alias is used only when the pane's shell can actually run it: the shell
+   has to be one the hook installs into, and it has to have **started after its
+   own rc was last written**. A running shell keeps the rc it read at startup,
+   so a hook installed five minutes ago is invisible to every shell already
+   open, and typing a command the shell does not know leaves the pane unarmed.
+   Otherwise the command is spelled out in full. As a second line of defence,
+   a pane found sitting at a bare shell after being armed is always re-armed
+   with the spelled-out form, so an unrunnable command can never be retyped on
+   every scan.
 3. **`restore`** — a sweep that re-arms any pane whose stub is missing. It runs
    automatically when the watcher starts and at the top of every scan, and can
    be run by hand at any time. It is never gated by `DRY_RUN`, because it only

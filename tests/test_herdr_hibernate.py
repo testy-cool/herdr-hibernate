@@ -571,25 +571,70 @@ class HibernateTests(unittest.TestCase):
         self.assertNotIn("\\033[", command)
         self.assertLessEqual(len(command.splitlines()), 1)
 
-    def test_arm_command_is_one_word_when_the_shell_hook_defines_it(self):
-        rc = os.path.join(self.tempdir.name, "rc")
+    def shell_info(self, name="zsh", pid=4242):
+        return {"shell_pid": pid,
+                "foreground_processes": [{"pid": pid, "name": name, "argv": [name]}]}
+
+    def rc_with(self, shell, body, shell_started_after=True):
+        """Point `shell`'s rc at a temp file and place it either side of the
+        pane shell's start time (which the fixture pins at a minute ago)."""
+        rc = os.path.join(self.tempdir.name, "%src" % shell)
         with open(rc, "w", encoding="utf-8") as fh:
-            fh.write(hibernate.SHELL_HOOK)
-        with mock.patch.object(hibernate, "SHELL_RC_FILES", [rc]), \
-                mock.patch.object(hibernate, "_arm_in_rc", None):
-            command = hibernate.stub_command("w1:p1")
+            fh.write(body)
+        written = time.time() - (3600 if shell_started_after else 0)
+        os.utime(rc, (written, written))
+        return (mock.patch.dict(hibernate.SHELL_RC_FOR, {shell: rc}),
+                mock.patch.object(hibernate, "proc_uptime_minutes",
+                                  return_value=1.0))
+
+    def test_arm_command_is_one_word_when_the_pane_shell_has_the_function(self):
+        rc, age = self.rc_with("zsh", hibernate.SHELL_HOOK)
+        with rc, age:
+            command = hibernate.stub_command("w1:p1", self.shell_info("zsh"))
 
         self.assertEqual(command, "hb-arm w1_p1")
 
     def test_arm_command_spells_itself_out_when_the_hook_is_stale(self):
         """An older hook has the marker but not the function."""
-        rc = os.path.join(self.tempdir.name, "rc")
-        with open(rc, "w", encoding="utf-8") as fh:
-            fh.write(hibernate.SHELL_HOOK_MARK + "\nold hook\n"
-                     + hibernate.SHELL_HOOK_END + "\n")
-        with mock.patch.object(hibernate, "SHELL_RC_FILES", [rc]), \
-                mock.patch.object(hibernate, "_arm_in_rc", None):
-            command = hibernate.stub_command("w1:p1")
+        rc, age = self.rc_with("zsh", hibernate.SHELL_HOOK_MARK + "\nold\n"
+                               + hibernate.SHELL_HOOK_END + "\n")
+        with rc, age:
+            command = hibernate.stub_command("w1:p1", self.shell_info("zsh"))
+
+        self.assertIn("bash ", command)
+        self.assertNotIn("hb-arm", command)
+
+    def test_a_shell_older_than_the_hook_never_gets_the_alias(self):
+        """The bug: a running shell keeps the rc it read at startup."""
+        rc, age = self.rc_with("zsh", hibernate.SHELL_HOOK,
+                               shell_started_after=False)
+        with rc, age:
+            command = hibernate.stub_command("w1:p1", self.shell_info("zsh"))
+
+        self.assertNotIn("hb-arm", command)
+
+    def test_a_shell_we_do_not_install_into_never_gets_the_alias(self):
+        rc, age = self.rc_with("zsh", hibernate.SHELL_HOOK)
+        with rc, age:
+            command = hibernate.stub_command("w1:p1", self.shell_info("fish"))
+
+        self.assertNotIn("hb-arm", command)
+
+    def test_a_bash_pane_is_not_helped_by_a_hook_in_zshrc(self):
+        rc, age = self.rc_with("zsh", hibernate.SHELL_HOOK)
+        missing = mock.patch.dict(
+            hibernate.SHELL_RC_FOR,
+            {"bash": os.path.join(self.tempdir.name, "nope")})
+        with rc, age, missing:
+            command = hibernate.stub_command("w1:p1", self.shell_info("bash"))
+
+        self.assertNotIn("hb-arm", command)
+
+    def test_plain_forces_the_spelled_out_form(self):
+        rc, age = self.rc_with("zsh", hibernate.SHELL_HOOK)
+        with rc, age:
+            command = hibernate.stub_command("w1:p1", self.shell_info("zsh"),
+                                             plain=True)
 
         self.assertIn("bash ", command)
         self.assertNotIn("hb-arm", command)
@@ -600,11 +645,11 @@ class HibernateTests(unittest.TestCase):
         os.makedirs(os.path.dirname(stub), exist_ok=True)
         with open(stub, "w", encoding="utf-8") as fh:
             fh.write("echo armed:$HERDR_HIBERNATE_STUB\n")
-        script = "%s\n%s\n" % (
+        script = "%s\n%s w1_p1\n" % (
             hibernate.SHELL_HOOK.replace(
                 "$HOME/.config/herdr-hibernate/panes",
                 os.path.dirname(stub)),
-            hibernate.stub_command("w1:p1"))
+            hibernate.ARM_FUNCTION)
         for shell in ("bash", "zsh"):
             with self.subTest(shell=shell):
                 run = subprocess.run(

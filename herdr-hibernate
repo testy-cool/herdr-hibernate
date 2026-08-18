@@ -49,8 +49,12 @@ SELF = os.path.abspath(__file__)
 SHELL_HOOK_MARK = "# >>> herdr-hibernate pane stub hook >>>"
 SHELL_HOOK_END = "# <<< herdr-hibernate pane stub hook <<<"
 # Both, not just the login shell's: Herdr can spawn either, and a pane armed
-# under one shell must still re-arm itself under the other after a reboot.
-SHELL_RC_FILES = [os.path.expanduser("~/.bashrc"), os.path.expanduser("~/.zshrc")]
+# under one shell must still re-arm itself under the other after a reboot. Kept
+# per shell because the arming function only exists in the rc of the shell that
+# actually read it — a zsh pane is not helped by a hook sitting in ~/.bashrc.
+SHELL_RC_FOR = {"bash": os.path.expanduser("~/.bashrc"),
+                "zsh": os.path.expanduser("~/.zshrc")}
+SHELL_RC_FILES = list(SHELL_RC_FOR.values())
 
 UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 
@@ -1207,7 +1211,7 @@ def remove_stub_file(pane_id):
         pass
 
 
-def stub_command(pane_id):
+def stub_command(pane_id, info=None, plain=False):
     """Command that arms the pane's stub as a CHILD of the pane shell.
 
     Never `exec` here: the pane's own shell has to outlive both the stub and
@@ -1219,7 +1223,8 @@ def stub_command(pane_id):
     # is not actually in the user's rc, because an unarmed pane would be
     # re-armed with the same missing command on every scan, forever.
     stub = pane_file(pane_id)
-    if shell_hook_defines_arm():
+    if not plain and pane_shell_has_arm(info if info is not None
+                                        else pane_process_info(pane_id)):
         return "%s %s" % (ARM_FUNCTION,
                           shlex.quote(os.path.basename(stub)[:-len(".sh")]))
     # `stty sane` is the one part worth spelling out: a killed agent can leave
@@ -1228,28 +1233,32 @@ def stub_command(pane_id):
     return "stty sane 2>/dev/null || true; bash %s" % shlex.quote(stub)
 
 
-_arm_in_rc = None
+def pane_shell_has_arm(info):
+    """Can the shell sitting in THIS pane run the hook's arming function?
 
-
-def shell_hook_defines_arm(rcs=None):
-    """Is the arming function actually defined in a shell rc we install into?
-
-    Checked against the rc text rather than the hook marker: a user who
-    installed an older version has the marker but not the function.
+    Asking the rc file alone is not enough, and getting that wrong left a pane
+    unarmed: a shell keeps whatever rc it read at startup, so a hook installed
+    five minutes ago is invisible to every shell that was already running. The
+    shell therefore has to be one we install into, and it has to have started
+    after its own rc was last written.
     """
-    global _arm_in_rc
-    if _arm_in_rc is None:
-        needle = "%s()" % ARM_FUNCTION
-        _arm_in_rc = False
-        for rc in (rcs if rcs is not None else SHELL_RC_FILES):
-            try:
-                with open(rc, encoding="utf-8", errors="replace") as fh:
-                    if needle in fh.read():
-                        _arm_in_rc = True
-                        break
-            except OSError:
-                continue
-    return _arm_in_rc
+    procs = (info or {}).get("foreground_processes") or []
+    shell_pid = (info or {}).get("shell_pid")
+    name = next((p.get("name") for p in procs if p.get("pid") == shell_pid), None)
+    rc = SHELL_RC_FOR.get(name)
+    if rc is None or not shell_pid:
+        return False
+    try:
+        with open(rc, encoding="utf-8", errors="replace") as fh:
+            if "%s()" % ARM_FUNCTION not in fh.read():
+                return False
+        written = os.stat(rc).st_mtime
+    except OSError:
+        return False
+    age = proc_uptime_minutes(shell_pid)
+    if age is None:
+        return False
+    return (time.time() - age * 60.0) > written
 
 
 def pane_process_info(pane_id):
@@ -1580,7 +1589,10 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
     state[pane_id] = rec
     save_state(state)
     write_stub_file(pane_id, rec)
-    herdr("pane", "run", pane_id, stub_command(pane_id))
+    command = stub_command(pane_id, info)
+    rec["armed_with_alias"] = command.startswith(ARM_FUNCTION + " ")
+    save_state(state)
+    herdr("pane", "run", pane_id, command)
     try:
         if marked_label and label != marked_label:
             herdr("tab", "rename", tab_id, marked_label)
@@ -1743,8 +1755,15 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                 label, pane_id, rec["uuid"]))
             continue
         write_stub_file(pane_id, rec)
+        # This pane was armed and is now sitting at a bare shell, so the last
+        # command either ran and exited or was never understood. Either way,
+        # spelling it out is the one form that cannot fail twice — without
+        # this, an unrunnable command is retyped every scan, forever.
+        plain = bool(rec.pop("armed_with_alias", False))
         try:
-            herdr("pane", "run", pane_id, stub_command(pane_id))
+            command = stub_command(pane_id, plain=plain)
+            rec["armed_with_alias"] = command.startswith(ARM_FUNCTION + " ")
+            herdr("pane", "run", pane_id, command)
         except RuntimeError as exc:  # pane vanished mid-sweep; try again later
             log("SKIP restore %s (%s): %s" % (label, pane_id, exc))
             continue
