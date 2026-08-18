@@ -412,6 +412,233 @@ def transcript_age_minutes(uuid, agent="claude"):
     return max(0.0, (time.time() - newest) / 60.0)
 
 
+# ------------------------------------------------- last exchange (stub excerpt)
+#
+# A killed agent's conversation is gone: Claude Code, Codex and Grok all draw on
+# the alternate screen buffer, so the moment the process exits the terminal
+# restores the normal buffer and every visible turn goes with it. Nothing the
+# watcher does can preserve that scrollback. The only text that survives is text
+# the stub itself prints, so the stub reprints the tail of the conversation from
+# the transcript that is already on disk.
+
+EXCERPT_TAIL_BYTES = 1024 * 1024
+EXCERPT_WIDE_TAIL_BYTES = 12 * 1024 * 1024
+EXCERPT_USER_CHARS = 320
+EXCERPT_AGENT_CHARS = 1400
+
+# Pseudo-user entries: hooks, slash-command wrappers, background task results
+# and skill injections all arrive as role "user". None of them is something the
+# human typed, so none belongs in an excerpt labelled "you".
+MACHINE_TURN_PREFIXES = (
+    "<task-notification", "<command-name", "<command-message", "<command-args",
+    "<local-command-stdout", "<local-command-stderr", "<system-reminder",
+    "<user-prompt-submit-hook", "<bash-input", "<bash-stdout", "<bash-stderr",
+    "<environment_context", "<user_instructions", "# AGENTS.md instructions",
+    "Caveat:", "This session is being continued from a previous conversation",
+)
+REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+# A bare slash command (/compact, /clear) is an instruction to the harness, not
+# a turn in the conversation, and the last one is often the only thing standing
+# between the reader and the exchange they actually want to recognise.
+BARE_COMMAND_RE = re.compile(r"^/[A-Za-z0-9:._-]+$")
+
+
+def _tail_objects(path, limit=None):
+    """Parsed JSON lines from the end of a transcript, oldest first.
+
+    A partial first line is expected whenever the file is bigger than the
+    window, and simply fails to parse — no need to hunt for a line boundary.
+    """
+    limit = EXCERPT_TAIL_BYTES if limit is None else limit
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > limit:
+                fh.seek(size - limit)
+            raw = fh.read()
+    except OSError:
+        return []
+    objects = []
+    for line in raw.splitlines():
+        try:
+            obj = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(obj, dict):
+            objects.append(obj)
+    return objects
+
+
+def _clean_turn_text(text):
+    """One flowed paragraph, or '' if the text is machine chatter.
+
+    Wrapping happens in the stub at print time (the pane can be resized after
+    hibernation), so everything here collapses to a single logical line.
+    """
+    text = REMINDER_RE.sub("", text or "").strip()
+    if not text or text.startswith(MACHINE_TURN_PREFIXES):
+        return ""
+    if BARE_COMMAND_RE.match(text):
+        return ""
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.M)  # headings read as noise
+    text = re.sub(r"^\s*\|[\s|:-]*\|\s*$", "", text, flags=re.M)  # table rules
+    text = text.replace("**", "").replace("`", "").replace("|", " ")
+    return " ".join(text.split())
+
+
+def _claude_turns(objects):
+    """(user, agent) text for a Claude Code transcript, newest exchange."""
+    user, agent = "", ""
+    for index in range(len(objects) - 1, -1, -1):
+        obj = objects[index]
+        if obj.get("type") != "user" or obj.get("isSidechain") or obj.get("isMeta"):
+            continue
+        if obj.get("toolUseResult") is not None:
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(block.get("text", "") for block in content
+                            if isinstance(block, dict) and block.get("type") == "text")
+        else:
+            continue
+        text = _clean_turn_text(text)
+        if not text:
+            continue
+        user = text
+        # The reply is whatever the agent said AFTER that prompt. Searching
+        # forward (not backward from the end) is what keeps a still-running
+        # turn honest: a prompt with no answer yet shows as a prompt alone,
+        # never paired with the previous turn's reply.
+        for later in objects[index + 1:]:
+            if later.get("type") != "assistant" or later.get("isSidechain"):
+                continue
+            blocks = (later.get("message") or {}).get("content")
+            if not isinstance(blocks, list):
+                continue
+            said = _clean_turn_text(" ".join(
+                block.get("text", "") for block in blocks
+                if isinstance(block, dict) and block.get("type") == "text"))
+            if said:
+                agent = said
+        break
+    if not user:
+        agent = _claude_last_reply(objects)
+    return user, agent
+
+
+def _claude_last_reply(objects):
+    """Last assistant text alone, for a window holding no prompt at all.
+
+    A tool-heavy session can push every prompt out of the read window; half an
+    exchange still tells the supervisor which pane this is.
+    """
+    for obj in reversed(objects):
+        if obj.get("type") != "assistant" or obj.get("isSidechain"):
+            continue
+        blocks = (obj.get("message") or {}).get("content")
+        if not isinstance(blocks, list):
+            continue
+        said = _clean_turn_text(" ".join(
+            block.get("text", "") for block in blocks
+            if isinstance(block, dict) and block.get("type") == "text"))
+        if said:
+            return said
+    return ""
+
+
+def _codex_turns(objects):
+    """(user, agent) text for a Codex rollout file, newest exchange."""
+    def message(obj):
+        payload = obj.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "message":
+            return None, ""
+        blocks = payload.get("content")
+        if not isinstance(blocks, list):
+            return None, ""
+        return payload.get("role"), " ".join(
+            block.get("text", "") for block in blocks if isinstance(block, dict))
+
+    user, agent = "", ""
+    for index in range(len(objects) - 1, -1, -1):
+        role, text = message(objects[index])
+        if role != "user":
+            continue
+        text = _clean_turn_text(text)
+        if not text:
+            continue
+        user = text
+        for later in objects[index + 1:]:
+            role, said = message(later)
+            if role == "assistant":
+                said = _clean_turn_text(said)
+                if said:
+                    agent = said
+        break
+    if not user:
+        for obj in reversed(objects):
+            role, said = message(obj)
+            if role == "assistant":
+                said = _clean_turn_text(said)
+                if said:
+                    agent = said
+                    break
+    return user, agent
+
+
+# Registered after definition: AGENTS is declared at the top of the file as the
+# single place agent differences live, but these readers need the helpers above.
+# Grok has no reader yet (no rollout on hand to verify its schema against); a
+# missing reader simply means no excerpt, which is the pre-excerpt banner.
+AGENTS["claude"]["turn_reader"] = _claude_turns
+AGENTS["codex"]["turn_reader"] = _codex_turns
+
+
+def last_exchange(uuid, agent="claude"):
+    """(user, agent) text of the newest exchange in a session, both possibly ''.
+
+    Only the MAIN transcript is read. Sub-agent transcripts (activity_globs)
+    are deliberately excluded: what the supervisor wants to recognise is their
+    own conversation, not a worker's.
+    """
+    spec = AGENTS.get(agent) or {}
+    reader = spec.get("turn_reader")
+    if reader is None:
+        return "", ""
+    paths = glob.glob(spec["transcript_glob"].format(sid=uuid))
+    if not paths:
+        return "", ""
+    try:
+        newest = max(paths, key=os.path.getmtime)
+    except OSError:
+        return "", ""
+    try:
+        user, said = reader(_tail_objects(newest))
+        if not user:
+            # Hundreds of tool results can bury the prompt. Widening once is
+            # far cheaper than reading every transcript at this size always.
+            try:
+                oversized = os.path.getsize(newest) > EXCERPT_TAIL_BYTES
+            except OSError:
+                oversized = False
+            if oversized:
+                wider = reader(_tail_objects(newest, EXCERPT_WIDE_TAIL_BYTES))
+                if wider[0] or wider[1]:
+                    user, said = wider
+    except Exception:  # a transcript schema change must never block a stub
+        return "", ""
+    return _ellipsize(user, EXCERPT_USER_CHARS), _ellipsize(said, EXCERPT_AGENT_CHARS)
+
+
+def _ellipsize(text, limit):
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return (cut or text[:limit]) + " …"
+
+
+
 def ps_snapshot():
     """{pid: (ppid, rss_kb, args)} for all processes."""
     out = subprocess.run(

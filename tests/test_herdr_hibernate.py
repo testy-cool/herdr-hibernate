@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 import tempfile
 import time
@@ -704,6 +705,139 @@ class WatcherGuardTests(unittest.TestCase):
                 {}, "w9:p9")
         self.assertEqual(decision, "skip")
         self.assertTrue(reason.startswith("busy:"))
+
+
+class LastExchangeTests(unittest.TestCase):
+    """The excerpt the hibernation stub reprints from an on-disk transcript."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = self.tempdir.name
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def write(self, agent, sid, entries):
+        path = os.path.join(self.root, "%s.jsonl" % sid)
+        with open(path, "w", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(json.dumps(entry) + "\n")
+        spec = dict(hibernate.AGENTS[agent])
+        spec["transcript_glob"] = os.path.join(self.root, "{sid}.jsonl")
+        return mock.patch.dict(hibernate.AGENTS, {agent: spec})
+
+    @staticmethod
+    def claude_user(text, **extra):
+        entry = {"type": "user", "message": {"role": "user", "content": text}}
+        entry.update(extra)
+        return entry
+
+    @staticmethod
+    def claude_agent(text, **extra):
+        entry = {"type": "assistant",
+                 "message": {"role": "assistant",
+                             "content": [{"type": "text", "text": text}]}}
+        entry.update(extra)
+        return entry
+
+    @staticmethod
+    def codex_message(role, text):
+        key = "input_text" if role == "user" else "output_text"
+        return {"type": "response_item",
+                "payload": {"type": "message", "role": role,
+                            "content": [{"type": key, "text": text}]}}
+
+    def test_claude_pairs_the_newest_prompt_with_its_reply(self):
+        with self.write("claude", "sid", [
+            self.claude_user("older question"),
+            self.claude_agent("older answer"),
+            self.claude_user("why is staging returning 404"),
+            self.claude_agent("The rewrite rule was wrong. Pushed a fix."),
+        ]):
+            self.assertEqual(
+                hibernate.last_exchange("sid", "claude"),
+                ("why is staging returning 404",
+                 "The rewrite rule was wrong. Pushed a fix."))
+
+    def test_unanswered_prompt_is_not_paired_with_an_older_reply(self):
+        """Hibernating mid-turn must not attribute the previous answer."""
+        with self.write("claude", "sid", [
+            self.claude_user("first"),
+            self.claude_agent("first answer"),
+            self.claude_user("second, still running"),
+        ]):
+            self.assertEqual(hibernate.last_exchange("sid", "claude"),
+                             ("second, still running", ""))
+
+    def test_machine_authored_user_entries_are_skipped(self):
+        """Hooks, tool results, sub-agents and compaction are not the human."""
+        with self.write("claude", "sid", [
+            self.claude_user("the real question"),
+            self.claude_agent("the real answer"),
+            self.claude_user("sidechain prompt", isSidechain=True),
+            self.claude_agent("sidechain answer", isSidechain=True),
+            self.claude_user("skill injection", isMeta=True),
+            self.claude_user([{"type": "tool_result", "content": "ok"}],
+                             toolUseResult={"ok": True}),
+            self.claude_user("<task-notification>\n<status>done</status>"),
+            self.claude_user("/compact"),
+            self.claude_user(
+                "This session is being continued from a previous conversation"),
+        ]):
+            self.assertEqual(hibernate.last_exchange("sid", "claude"),
+                             ("the real question", "the real answer"))
+
+    def test_codex_reads_its_own_rollout_shape(self):
+        with self.write("codex", "sid", [
+            {"type": "event_msg", "payload": {"type": "token_count"}},
+            self.codex_message("developer", "system preamble"),
+            self.codex_message("user", "add the retry guard"),
+            self.codex_message("assistant", "Added it and committed."),
+        ]):
+            self.assertEqual(hibernate.last_exchange("sid", "codex"),
+                             ("add the retry guard", "Added it and committed."))
+
+    def test_a_prompt_buried_past_the_window_still_shows_the_reply(self):
+        """Tool-heavy sessions can push every prompt out of the read window."""
+        filler = {"type": "assistant",
+                  "message": {"role": "assistant",
+                              "content": [{"type": "tool_use", "id": "x" * 4000}]}}
+        entries = [self.claude_user("buried")] + [filler] * 40 + [
+            self.claude_agent("the surviving answer")]
+        with self.write("claude", "sid", entries):
+            with mock.patch.object(hibernate, "EXCERPT_TAIL_BYTES", 8 * 1024), \
+                    mock.patch.object(hibernate, "EXCERPT_WIDE_TAIL_BYTES", 8 * 1024):
+                self.assertEqual(hibernate.last_exchange("sid", "claude"),
+                                 ("", "the surviving answer"))
+
+    def test_widening_the_window_recovers_the_prompt(self):
+        filler = {"type": "assistant",
+                  "message": {"role": "assistant",
+                              "content": [{"type": "tool_use", "id": "x" * 4000}]}}
+        entries = [self.claude_user("buried but reachable")] + [filler] * 40 + [
+            self.claude_agent("the answer")]
+        with self.write("claude", "sid", entries):
+            with mock.patch.object(hibernate, "EXCERPT_TAIL_BYTES", 8 * 1024):
+                self.assertEqual(hibernate.last_exchange("sid", "claude"),
+                                 ("buried but reachable", "the answer"))
+
+    def test_long_turns_are_ellipsized_not_dumped(self):
+        with self.write("claude", "sid", [
+            self.claude_user("word " * 400),
+            self.claude_agent("reply " * 900),
+        ]):
+            user, said = hibernate.last_exchange("sid", "claude")
+        self.assertLessEqual(len(user), hibernate.EXCERPT_USER_CHARS + 2)
+        self.assertLessEqual(len(said), hibernate.EXCERPT_AGENT_CHARS + 2)
+        self.assertTrue(user.endswith("…") and said.endswith("…"))
+
+    def test_an_agent_without_a_reader_yields_no_excerpt(self):
+        """Grok has no verified reader yet; that must degrade, not raise."""
+        self.assertNotIn("turn_reader", hibernate.AGENTS["grok"])
+        self.assertEqual(hibernate.last_exchange("sid", "grok"), ("", ""))
+
+    def test_a_missing_transcript_yields_no_excerpt(self):
+        self.assertEqual(hibernate.last_exchange("nope", "claude"), ("", ""))
 
 
 if __name__ == "__main__":
