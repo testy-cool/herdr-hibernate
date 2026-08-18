@@ -1209,12 +1209,15 @@ def stub_command(pane_id):
     Never `exec` here: the pane's own shell has to outlive both the stub and
     the claude it resumes, otherwise the next hibernation closes the tab.
     """
-    # Reset before starting the script as well as inside it. This closes the
-    # normal post-kill window where Codex or Grok can leave focus reporting on.
-    return ("stty sane 2>/dev/null || true; "
-            "printf '\\033[?1004l\\033[?2004l\\033[?1000l\\033[?1002l"
-            "\\033[?1003l\\033[?1006l'; bash %s"
-            % shlex.quote(pane_file(pane_id)))
+    # This text is TYPED into the pane's shell, so the shell echoes it and the
+    # user reads it. `stty sane` earns its place there: a killed agent can leave
+    # the line discipline in raw mode, and the shell has to be able to take the
+    # command at all. The emulator-mode escapes do not — they are echoed as
+    # literal `\\033[?1004l` noise, four wrapped lines of it above the banner,
+    # to close a window a few milliseconds wide that _hb_reset_terminal closes
+    # again as the script's first statement.
+    return "stty sane 2>/dev/null || true; bash %s" % shlex.quote(
+        pane_file(pane_id))
 
 
 def pane_process_info(pane_id):

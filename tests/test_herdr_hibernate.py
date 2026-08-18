@@ -559,12 +559,31 @@ class HibernateTests(unittest.TestCase):
                       "    _hb_reset_terminal", body)
         self.assertNotIn("\n    clear", body)
 
-    def test_arm_command_resets_terminal_before_starting_stub(self):
+    def test_arm_command_fixes_the_line_discipline_before_starting_stub(self):
         command = hibernate.stub_command("w1:p1")
 
         self.assertLess(command.index("stty sane"), command.index("bash "))
-        self.assertIn("\\033[?1004l", command)
         self.assertNotIn("clear", command)
+
+    def test_arm_command_carries_no_escape_noise_for_the_user_to_read(self):
+        """It is typed into the pane, so the shell echoes every byte of it."""
+        command = hibernate.stub_command("w1:p1")
+        self.assertNotIn("\\033[", command)
+        self.assertLessEqual(len(command.splitlines()), 1)
+
+    def test_the_stub_itself_still_resets_the_emulator_modes(self):
+        """Which is why the arm command does not have to."""
+        rec = {
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "agent": "claude", "cwd": "/tmp", "freed_mb": 1,
+            "resume": ["claude", "--resume",
+                       "11111111-1111-1111-1111-111111111111"],
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(hibernate.write_stub_file("w1:p1", rec), encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("\\033[?1004l", body)
+        self.assertIn("export HERDR_HIBERNATE_STUB=1\n    _hb_reset_terminal", body)
 
 
 class WatcherGuardTests(unittest.TestCase):
