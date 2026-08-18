@@ -980,6 +980,51 @@ class LastExchangeTests(unittest.TestCase):
             self.assertEqual(hibernate.last_exchange("sid", "claude")[1],
                              ("agent", "See the README contract."))
 
+    def test_a_fenced_code_block_keeps_one_command_per_line(self):
+        """Run-on commands are unreadable and, worse, uncopyable."""
+        reply = ("From a shell:\n\n"
+                 "```bash\n"
+                 "herdr-hibernate now\n"
+                 "herdr-hibernate hibernate w2:p3\n"
+                 "```\n\n"
+                 "Run those from inside a pane.")
+        with self.write("claude", "sid", [
+            self.claude_user("how do i hibernate"),
+            self.claude_agent(reply),
+        ]):
+            said = hibernate.last_exchange("sid", "claude")[1][1]
+        self.assertEqual(said.splitlines(),
+                         ["From a shell:",
+                          "herdr-hibernate now",
+                          "herdr-hibernate hibernate w2:p3",
+                          "Run those from inside a pane."])
+
+    def test_list_items_get_a_line_each_and_keep_their_wrapped_text(self):
+        reply = ("Two ways:\n"
+                 "- Ctrl-A then Shift-H hibernates the focused pane,\n"
+                 "  skipping the idle threshold\n"
+                 "- Ctrl-A then Shift-Z does the whole workspace\n")
+        with self.write("claude", "sid", [
+            self.claude_user("how"), self.claude_agent(reply)]):
+            said = hibernate.last_exchange("sid", "claude")[1][1]
+        self.assertEqual(said.splitlines(), [
+            "Two ways:",
+            "- Ctrl-A then Shift-H hibernates the focused pane, "
+            "skipping the idle threshold",
+            "- Ctrl-A then Shift-Z does the whole workspace"])
+
+    def test_prose_is_still_flowed_into_one_line_per_paragraph(self):
+        """A line break mid-sentence carries nothing; the stub rewraps anyway."""
+        with self.write("claude", "sid", [
+            self.claude_user("q"),
+            self.claude_agent("One sentence\nbroken over lines.\n\nA second "
+                              "paragraph."),
+        ]):
+            said = hibernate.last_exchange("sid", "claude")[1][1]
+        self.assertEqual(said.splitlines(),
+                         ["One sentence broken over lines.",
+                          "A second paragraph."])
+
     def test_an_agent_without_a_reader_yields_no_excerpt(self):
         """Grok has no verified reader yet; that must degrade, not raise."""
         self.assertNotIn("turn_reader", hibernate.AGENTS["grok"])

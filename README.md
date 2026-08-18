@@ -320,6 +320,10 @@ Enough to know what the pane was doing without resuming it, which is the point.
   prompt has no reply — a pane parked mid-turn, or one where the last thing
   typed was `test`, would read `you test` and stop. The answered exchange
   behind it is what identifies the pane.
+- **Lists and code blocks keep their shape.** One command per line, one bullet
+  per bullet. Ordinary prose is still reflowed into a paragraph, because a
+  source line break mid-sentence carries nothing and the stub rewraps to the
+  pane width anyway.
 - **Both turns are printed in full.** A reply cut off after a few lines is the
   thing that sends you back into the pane to read the rest, which is exactly
   what this is here to avoid. Set `EXCERPT_LINES` to a number if you would

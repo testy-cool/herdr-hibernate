@@ -527,8 +527,47 @@ def _clean_turn_text(text):
     text = MD_LINK_RE.sub(r"\1", text)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.M)  # headings read as noise
     text = re.sub(r"^\s*\|[\s|:-]*\|\s*$", "", text, flags=re.M)  # table rules
-    text = text.replace("**", "").replace("`", "").replace("|", " ")
-    return " ".join(text.split())
+    text = text.replace("**", "").replace("|", " ")
+    return reflow(text)
+
+
+FENCE_RE = re.compile(r"^\s*```")
+LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s|\d{1,3}[.)]\s)")
+
+
+def reflow(text):
+    """Flow prose into one line per paragraph, but keep lists and code intact.
+
+    Collapsing every newline turned a fenced block of shell commands into a
+    single run-on line with the commands abutting each other — unreadable, and
+    worse, nothing you could copy. Prose has no such shape to lose, so it is
+    still flowed: the stub wraps to the pane width at print time and a source
+    line break in the middle of a sentence means nothing here.
+    """
+    lines, buffer, in_code = [], [], False
+
+    def flush():
+        if buffer:
+            lines.append(" ".join(" ".join(buffer).split()))
+            del buffer[:]
+
+    for raw in text.splitlines():
+        if FENCE_RE.match(raw):
+            flush()
+            in_code = not in_code
+            continue
+        if in_code:
+            flush()
+            lines.append(raw.rstrip().replace("`", ""))
+            continue
+        if not raw.strip():
+            flush()
+            continue
+        if LIST_ITEM_RE.match(raw):
+            flush()  # a marker always starts a new line; its wrapped
+        buffer.append(raw)  # continuation joins it, having no marker of its own
+    flush()
+    return "\n".join(line for line in lines if line.strip()).replace("`", "")
 
 
 def _claude_turns(objects):
