@@ -23,6 +23,7 @@ moment the process exits.
 | Claude Code | `claude --resume <uuid>` | 650–930 MB |
 | Codex CLI | `codex resume <uuid>` | ~550 MB, multi-GB after sub-agent runs |
 | Grok (xAI Grok Build) | `grok --resume <uuid> --cwd <dir>` | ~35 MB plus your MCP servers |
+| pi | `pi --session <path>` | ~180 MB |
 
 However a session was allowed to act — `--dangerously-skip-permissions`,
 `--yolo`, `--always-approve`, an explicit `--permission-mode` or sandbox

@@ -58,6 +58,16 @@ SHELL_RC_FILES = list(SHELL_RC_FOR.values())
 
 UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 
+
+def _pi_session_id(value):
+    """pi's session id, from whatever Herdr reported for the pane.
+
+    Every other agent is reported as a bare id; pi is reported as the path of
+    its session file, `<iso-timestamp>_<uuid>.jsonl`.
+    """
+    match = re.search(r"(%s)\.jsonl$" % UUID_RE, value or "")
+    return match.group(1) if match else value
+
 # Per-agent adapters — herdr's `agent` value -> how to measure idle time, find
 # the process, and resume a killed session. Only agents listed here are ever
 # hibernated: killing anything without a proven resume path would lose the
@@ -118,6 +128,24 @@ AGENTS = {
             "--oss", "--yolo",
             "--dangerously-bypass-approvals-and-sandbox",
         ),
+    },
+    "pi": {
+        # <session-dir>/<encoded-cwd>/<iso-timestamp>-<uuid>.jsonl
+        "transcript_glob": os.path.expanduser(
+            "~/.pi/agent/sessions/*/*_{sid}.jsonl"),
+        "bin": "pi",
+        # By absolute path, never by bare id: pi resolves an id against the
+        # CURRENT project, so resuming from anywhere else stops at an
+        # interactive "Fork this session? [y/N]", which would hang the pane.
+        # The stub does cd to the recorded cwd, but falls back to $HOME if that
+        # directory has since gone, and a path is immune to both.
+        "resume_argv": ["pi", "--session", "{transcript}"],
+        "session_in_args": r"--session(?:-id)?\s+\S*?(%s)" % UUID_RE,
+        "helper_tokens": (),
+        # Herdr reports the session file's path, not an id.
+        "session_from_value": _pi_session_id,
+        "replay_flags": ("--model", "--provider", "--mode", "--thinking"),
+        "replay_bool_flags": ("--approve", "-a", "--no-approve", "-na"),
     },
     "grok": {
         # xAI Grok Build. The session dir is named by the session uuid, nested
@@ -603,6 +631,33 @@ def _claude_turns(objects):
     return turns
 
 
+def _pi_turns(objects):
+    """Every real turn in a pi transcript, oldest first."""
+    turns = []
+    for obj in objects:
+        if obj.get("type") != "message":
+            continue
+        message = obj.get("message") or {}
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            # assistant turns also carry `thinking` blocks, which are not the
+            # answer and are not what identifies the pane.
+            text = " ".join(block.get("text", "") for block in content
+                            if isinstance(block, dict)
+                            and block.get("type") == "text")
+        else:
+            continue
+        text = _clean_turn_text(text)
+        if text:
+            turns.append(("user" if role == "user" else "agent", text))
+    return turns
+
+
 def _codex_turns(objects):
     """Every real turn in a Codex rollout file, oldest first."""
     turns = []
@@ -650,6 +705,7 @@ def tail_exchange(turns):
 # missing reader simply means no excerpt, which is the pre-excerpt banner.
 AGENTS["claude"]["turn_reader"] = _claude_turns
 AGENTS["codex"]["turn_reader"] = _codex_turns
+AGENTS["pi"]["turn_reader"] = _pi_turns
 
 
 def last_exchange(uuid, agent="claude"):
@@ -815,7 +871,9 @@ ARGV_SESSION_WINDOW_MINUTES = 10
 def session_uuid(pane, info=None):
     sess = pane.get("agent_session")
     if isinstance(sess, dict) and sess.get("value"):
-        return sess["value"]
+        spec = AGENTS.get(pane.get("agent")) or {}
+        reader = spec.get("session_from_value")
+        return reader(sess["value"]) if reader else sess["value"]
     if pane.get("agent") == "grok":
         found = grok_session_id(pane)
         if found:
@@ -1541,7 +1599,15 @@ def build_resume(agent, sid, proc, cwd):
     """Resume argv for a session, with whitelisted flags replayed from the
     process being killed (so e.g. a codex model override survives resume)."""
     spec = AGENTS[agent]
-    base = [tok.format(sid=sid, cwd=cwd) for tok in spec["resume_argv"]]
+    transcript = ""
+    if any("{transcript}" in tok for tok in spec["resume_argv"]):
+        found = sorted(glob.glob(spec["transcript_glob"].format(sid=sid)))
+        # classify proved this exists before anything was killed; if it has
+        # gone since, fall back to the id and let the agent report the miss
+        # rather than baking an empty argument into the stub.
+        transcript = found[-1] if found else sid
+    base = [tok.format(sid=sid, cwd=cwd, transcript=transcript)
+            for tok in spec["resume_argv"]]
     keep = spec["replay_flags"]
     argv = (proc or {}).get("argv") or []
     if not keep or not argv:

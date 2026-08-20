@@ -24,6 +24,18 @@ from the killed process are replayed on resume, including `--model`,
 `--profile`, `--yolo`, and the sandbox and approval settings — a resumed session is never
 *less* restricted than the one that was killed.
 
+**pi** — `~/.pi/agent/sessions/<encoded-cwd>/<iso-timestamp>_<uuid>.jsonl`.
+Herdr reports pi's session as that file's *path* rather than as an id, so the
+id is taken out of the filename for everything that needs one. The resume goes
+back by absolute path, never by bare id: pi resolves an id against the current
+project, and resuming from anywhere else stops at an interactive
+`Fork this session? [y/N]` that would hang the pane. The stub does cd to the
+recorded cwd first, but falls back to `$HOME` when that directory has since
+gone, and a path survives both. Verified end to end: parking a live pi pane
+freed 181 MB, and it came back on the same session file with its context
+counters intact. `--approve`, `--model`, `--provider`, `--mode` and
+`--thinking` are replayed.
+
 **Grok** — `~/.grok/sessions/<encoded-cwd>/<uuid>/`, with `updates.jsonl` as the
 authoritative log. `--always-approve`, `--permission-mode`, `--sandbox` and
 `--model` are replayed; `--cwd` is not, because the resume command sets it. Herdr has no Grok integration and reports no session id, so

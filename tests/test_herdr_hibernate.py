@@ -1563,6 +1563,84 @@ class YoloModeTests(unittest.TestCase):
                     or "sandbox" in f or "danger" in f for f in flags),
                 "%s replays nothing that governs what it may do" % agent)
 
+class PiAgentTests(unittest.TestCase):
+    """pi is the one agent Herdr reports by session PATH rather than by id."""
+
+    SID = "01a01f64-5386-753d-afe3-c5d8f495a9d1"
+    PATH = ("/home/x/.pi/agent/sessions/--home-x-Work-proj--/"
+            "2026-08-20T13-37-43-814Z_01a01f64-5386-753d-afe3-c5d8f495a9d1.jsonl")
+
+    def test_the_id_is_taken_out_of_the_path_herdr_reports(self):
+        self.assertEqual(hibernate._pi_session_id(self.PATH), self.SID)
+
+    def test_a_bare_id_is_left_alone(self):
+        self.assertEqual(hibernate._pi_session_id(self.SID), self.SID)
+
+    def test_session_uuid_normalises_only_for_pi(self):
+        pane = {"pane_id": "w1:p1", "agent": "pi",
+                "agent_session": {"kind": "path", "value": self.PATH}}
+        self.assertEqual(hibernate.session_uuid(pane), self.SID)
+        claude = {"pane_id": "w1:p1", "agent": "claude",
+                  "agent_session": {"kind": "id", "value": self.SID}}
+        self.assertEqual(hibernate.session_uuid(claude), self.SID)
+
+    def test_the_normalised_id_passes_the_uuid_check_that_gates_a_kill(self):
+        self.assertRegex(hibernate._pi_session_id(self.PATH),
+                         "^%s$" % hibernate.UUID_RE)
+
+    def test_resume_uses_the_absolute_path_not_the_bare_id(self):
+        """A bare id resolves against the CURRENT project, and stops at an
+        interactive fork prompt when resumed from anywhere else."""
+        with tempfile.TemporaryDirectory() as d:
+            sessions = os.path.join(d, "--home-x-proj--")
+            os.makedirs(sessions)
+            real = os.path.join(sessions, "2026-08-20T13-37-43-814Z_%s.jsonl"
+                                % self.SID)
+            open(real, "w").close()
+            with mock.patch.dict(hibernate.AGENTS["pi"],
+                                 {"transcript_glob":
+                                  os.path.join(d, "*", "*_{sid}.jsonl")}):
+                argv = hibernate.build_resume("pi", self.SID, {"argv": ["pi"]},
+                                              "/home/x/proj")
+        self.assertEqual(argv, ["pi", "--session", real])
+
+    def test_a_vanished_transcript_falls_back_to_the_id(self):
+        with mock.patch.dict(hibernate.AGENTS["pi"],
+                             {"transcript_glob": "/nonexistent/*_{sid}.jsonl"}):
+            argv = hibernate.build_resume("pi", self.SID, {"argv": ["pi"]}, "/x")
+        self.assertEqual(argv, ["pi", "--session", self.SID])
+
+    def test_pi_keeps_its_approval_flag_across_a_resume(self):
+        with mock.patch.dict(hibernate.AGENTS["pi"],
+                             {"transcript_glob": "/nonexistent/*_{sid}.jsonl"}):
+            argv = hibernate.build_resume(
+                "pi", self.SID, {"argv": ["pi", "--approve", "--model", "sonnet"]},
+                "/x")
+        self.assertIn("--approve", argv)
+        self.assertEqual(argv[-2:], ["--model", "sonnet"])
+
+    def test_the_excerpt_reads_a_real_pi_transcript(self):
+        objects = [
+            {"type": "session", "id": self.SID, "cwd": "/home/x"},
+            {"type": "model_change", "provider": "xai", "modelId": "grok-4.5"},
+            {"type": "message", "message": {"role": "user", "content": [
+                {"type": "text", "text": "what does this repo do?"}]}},
+            {"type": "message", "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "they want a one-liner"},
+                {"type": "text", "text": "It parks idle panes."}]}},
+        ]
+        self.assertEqual(hibernate._pi_turns(objects),
+                         [("user", "what does this repo do?"),
+                          ("agent", "It parks idle panes.")])
+
+    def test_thinking_is_never_shown_as_the_answer(self):
+        objects = [{"type": "message", "message": {"role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "secret"}]}}]
+        self.assertEqual(hibernate._pi_turns(objects), [])
+
+    def test_pi_is_wired_into_the_excerpt_table(self):
+        self.assertIs(hibernate.AGENTS["pi"]["turn_reader"], hibernate._pi_turns)
+
 
 if __name__ == "__main__":
     unittest.main()
