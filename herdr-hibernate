@@ -1073,8 +1073,17 @@ def classify(pane, tab_labels, cfg, state, self_pane):
     if age < threshold:
         return "skip", "idle only %s (< %sm threshold)" % (fmt_idle(age), int(threshold))
 
-    # Last (it costs a process-info call): an "idle" agent that spawned a
-    # still-running background job is watching something, not idle.
+    # Past here we are about to kill something, so the remaining guards may
+    # each cost a process-info call.
+    # Someone typing into the pane writes nothing to the transcript, so the
+    # clock above cannot see them. The terminal can.
+    drawn = pane_drawn_minutes(pane_process_info(pane_id))
+    if drawn is not None and drawn < threshold:
+        return "skip", ("pane last drawn %s ago — someone may be composing"
+                        % fmt_idle(drawn))
+
+    # An "idle" agent that spawned a still-running background job is watching
+    # something, not idle.
     job = busy_background_job(pane_id, uuid, agent, cfg)
     if job:
         return "skip", "busy: background job running (%s)" % job
@@ -1427,6 +1436,48 @@ def pane_shell_has_arm(info):
     return (time.time() - age * 60.0) > written
 
 
+def pane_tty(info):
+    """The pane's terminal device, from whichever process still holds it."""
+    if not info:
+        return None
+    pids = [info.get("shell_pid"), info.get("foreground_process_group_id")]
+    pids += [p.get("pid") for p in info.get("foreground_processes") or []]
+    for pid in pids:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        for fd in ("0", "1", "2"):
+            try:
+                target = os.readlink("/proc/%d/fd/%s" % (pid, fd))
+            except OSError:
+                continue
+            if target.startswith("/dev/pts/"):
+                return target
+    return None
+
+
+def pane_drawn_minutes(info):
+    """Minutes since anything was drawn in this pane, or None if unknowable.
+
+    The transcript clock only ticks when a turn completes, so a long prompt
+    being composed but not yet submitted is indistinguishable from an
+    abandoned pane — the agent is idle and has written nothing for an hour.
+    Every keystroke redraws the agent's input line, and that redraw is a write
+    to the pane's terminal, so this clock ticks while the transcript's does
+    not. Measured on a live pane: an idle agent holding an unsubmitted prompt
+    did not touch its terminal for eight seconds, and the first keystroke
+    moved it to now.
+    """
+    tty = pane_tty(info)
+    if not tty:
+        return None
+    try:
+        return max(0.0, (time.time() - os.stat(tty).st_mtime) / 60.0)
+    except OSError:
+        return None
+
+
 def pane_process_info(pane_id):
     try:
         return herdr("pane", "process-info", "--pane", pane_id)["process_info"]
@@ -1716,6 +1767,15 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
     if not force and up is not None and up < threshold:
         log("SKIP %s (%s): %s only started %s ago (likely just resumed)" % (
             label, pane_id, agent, fmt_idle(up)))
+        return False
+
+    # Re-read the terminal clock here, not just in classify: a scan takes
+    # seconds, and someone can start typing inside them. Losing a half-written
+    # prompt is not recoverable by resuming the session.
+    drawn = pane_drawn_minutes(info)
+    if not force and drawn is not None and drawn < threshold:
+        log("SKIP %s (%s): pane last drawn %s ago — someone may be composing"
+            % (label, pane_id, fmt_idle(drawn)))
         return False
 
     rss_mb = tree_rss_mb(pid, ps_snapshot())
@@ -2070,7 +2130,8 @@ def cmd_now():
 def cmd_hibernate(pane_id, force=False, notify=False):
     """Manual hibernate: bypasses the idle-time threshold, keeps all safety rules.
 
-    `force` additionally skips the just-resumed guard and the background-job
+    `force` additionally skips the just-resumed guard, the terminal-activity
+    guard and the background-job
     guard (an explicit request is not a mistake). The guard that refuses to
     kill a pane's own shell always applies — that one would close the tab.
     """

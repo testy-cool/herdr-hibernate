@@ -36,6 +36,29 @@ lines long after a conversation goes quiet, so a three-day-old session can show
 an mtime of seconds ago. Only entries carrying their own timestamp count, and
 the tool reads them from the tail of the file rather than parsing all of it.
 
+### The clock the transcript cannot see
+
+Nothing reaches the transcript until a turn completes. A prompt someone has
+been composing for an hour therefore looks exactly like a pane they walked
+away from: the agent is idle and has written nothing all that time. Parking it
+throws the draft away, and resuming the session does not bring it back,
+because it was never anywhere but the screen.
+
+So the pane's terminal is read as a second clock. Every keystroke redraws the
+agent's input line, and that redraw is a write to the pane's pts, which moves
+its mtime. A pane is only a candidate when *both* clocks are past the
+threshold. Measured on a live pane: an idle agent holding an unsubmitted
+prompt did not touch its terminal for eight seconds, and one keystroke moved
+it from three minutes to now.
+
+The clock is read again immediately before the kill, not only when the pane is
+classified, because a scan takes seconds and someone can start typing inside
+them. A pane whose terminal cannot be found degrades to the transcript clock
+alone rather than becoming unparkable, and `--force` skips the check.
+
+Anything else drawn in the pane counts as activity too. That is the safe
+direction to be wrong in: the cost is a pane that stays awake.
+
 ## Watchers and orchestrators
 
 An orchestrator waiting on workers *looks* idle — its prompt is empty and its

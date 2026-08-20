@@ -1384,6 +1384,119 @@ class ResumedAgentAgeTests(unittest.TestCase):
         self.assertTrue(os.path.exists(hibernate.pane_file("w1:p1")))
         self.assertTrue(os.path.exists(hibernate.awake_file("w1:p1")))
 
+class ComposingPromptTests(unittest.TestCase):
+    """A prompt being typed but not yet submitted must keep its pane alive.
+
+    Nothing reaches the transcript until a turn completes, so a pane someone
+    has been composing in for an hour is indistinguishable, by that clock,
+    from one they walked away from. Killing it throws the draft away, and
+    resuming the session does not bring it back.
+    """
+
+    UUID = "11111111-1111-1111-1111-111111111111"
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.tty = os.path.join(self.tempdir.name, "pts-stand-in")
+        open(self.tty, "w").close()
+        self.paths = mock.patch.multiple(
+            hibernate, CONFIG_DIR=self.tempdir.name,
+            LOG_FILE=os.path.join(self.tempdir.name, "log"))
+        self.paths.start()
+
+    def tearDown(self):
+        self.paths.stop()
+        self.tempdir.cleanup()
+
+    def drawn(self, minutes):
+        """Pretend the pane's terminal was last written to `minutes` ago."""
+        when = time.time() - minutes * 60
+        os.utime(self.tty, (when, when))
+        return mock.patch.object(hibernate, "pane_tty", return_value=self.tty)
+
+    def cfg(self):
+        return dict(hibernate.DEFAULTS, HIBERNATE_AFTER_MINUTES="30",
+                    BUSY_CHILD_MINUTES="0")
+
+    def pane(self):
+        return {"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle",
+                "tab_id": "w1:t1",
+                "agent_session": {"value": self.UUID}}
+
+    def classify(self, drawn_minutes, transcript_minutes=99.0):
+        with self.drawn(drawn_minutes), \
+                mock.patch.object(hibernate, "pane_process_info",
+                                  return_value={"shell_pid": 1}), \
+                mock.patch.object(hibernate, "transcript_age_minutes",
+                                  return_value=transcript_minutes):
+            return hibernate.classify(self.pane(), {}, self.cfg(), {}, "")
+
+    def test_a_pane_typed_into_a_moment_ago_is_left_alone(self):
+        decision, reason = self.classify(0.2)
+        self.assertEqual(decision, "skip", reason)
+        self.assertIn("composing", reason)
+
+    def test_an_hour_of_composing_still_protects_the_pane(self):
+        # The transcript has been silent all along; only the terminal knows.
+        decision, reason = self.classify(1.0, transcript_minutes=180.0)
+        self.assertEqual(decision, "skip", reason)
+
+    def test_a_pane_nobody_has_touched_is_still_parked(self):
+        decision, reason = self.classify(120.0)
+        self.assertEqual(decision, "hibernate", reason)
+
+    def test_an_unreadable_terminal_does_not_block_hibernation(self):
+        """No pts to stat must degrade to the transcript clock, not to refusing."""
+        with mock.patch.object(hibernate, "pane_tty", return_value=None), \
+                mock.patch.object(hibernate, "pane_process_info",
+                                  return_value={"shell_pid": 1}), \
+                mock.patch.object(hibernate, "transcript_age_minutes",
+                                  return_value=99.0):
+            decision, reason = hibernate.classify(
+                self.pane(), {}, self.cfg(), {}, "")
+        self.assertEqual(decision, "hibernate", reason)
+
+    def test_the_tty_is_found_through_a_foreground_process(self):
+        info = {"shell_pid": os.getpid(),
+                "foreground_processes": [{"pid": os.getpid()}]}
+        with mock.patch.object(os, "readlink", return_value="/dev/pts/7"):
+            self.assertEqual(hibernate.pane_tty(info), "/dev/pts/7")
+
+    def test_a_non_terminal_stdin_is_not_mistaken_for_a_tty(self):
+        with mock.patch.object(os, "readlink", return_value="/dev/null"):
+            self.assertIsNone(hibernate.pane_tty({"shell_pid": os.getpid()}))
+
+    def test_the_kill_path_rechecks_the_terminal_it_was_cleared_on(self):
+        """Someone can start typing in the seconds a scan takes."""
+        with self.drawn(0.1), \
+                mock.patch.object(hibernate, "find_agent_proc",
+                                  return_value=(100, {})), \
+                mock.patch.object(hibernate, "pane_process_info",
+                                  return_value={"shell_pid": 1}), \
+                mock.patch.object(hibernate, "agent_age_minutes",
+                                  return_value=900.0), \
+                mock.patch.object(hibernate, "kill_tree") as killer:
+            parked = hibernate.hibernate_pane(
+                self.pane(), {}, self.cfg(), {}, "99m", dry_run=False)
+        self.assertFalse(parked)
+        killer.assert_not_called()
+
+    def test_asking_for_it_by_hand_overrides_the_guard(self):
+        with self.drawn(0.1), \
+                mock.patch.object(hibernate, "find_agent_proc",
+                                  return_value=(100, {})), \
+                mock.patch.object(hibernate, "pane_process_info",
+                                  return_value={"shell_pid": 1}), \
+                mock.patch.object(hibernate, "agent_age_minutes",
+                                  return_value=900.0), \
+                mock.patch.object(hibernate, "herdr",
+                                  return_value={"pane": {"agent_status": "idle"}}), \
+                mock.patch.object(hibernate, "kill_tree",
+                                  return_value=(False, "stopped here")) as killer:
+            hibernate.hibernate_pane(self.pane(), {}, self.cfg(), {}, "99m",
+                                     dry_run=False, force=True)
+        killer.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
