@@ -89,7 +89,12 @@ AGENTS = {
         "resume_argv": ["claude", "--resume", "{sid}"],
         "session_in_args": r"--resume\s+(%s)" % UUID_RE,
         "helper_tokens": ("bg-pty-host", "bg-spare", " daemon "),
-        "replay_flags": (),
+        # A session resumed without the flag it was started with comes back
+        # asking permission for everything, which is not the session that was
+        # killed. Each agent spells the same idea differently.
+        "replay_flags": ("--permission-mode", "--model"),
+        "replay_bool_flags": ("--dangerously-skip-permissions",
+                              "--allow-dangerously-skip-permissions"),
     },
     "codex": {
         # rollout-<local-timestamp>-<uuid>.jsonl, nested by year/month/day.
@@ -124,7 +129,10 @@ AGENTS = {
         "resume_argv": ["grok", "--resume", "{sid}", "--cwd", "{cwd}"],
         "session_in_args": r"--resume\s+(%s)" % UUID_RE,
         "helper_tokens": (),
-        "replay_flags": (),
+        # --cwd is deliberately absent: resume_argv sets it already, and
+        # replaying it would pass the flag twice.
+        "replay_flags": ("--permission-mode", "--sandbox", "-m", "--model"),
+        "replay_bool_flags": ("--always-approve",),
         # grok transcripts stamp entries with epoch integers, not ISO strings.
         # Only enabled here: a numeric "timestamp" inside claude/codex tool
         # output must not be mistaken for an entry timestamp.

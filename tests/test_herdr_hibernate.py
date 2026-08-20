@@ -1497,6 +1497,72 @@ class ComposingPromptTests(unittest.TestCase):
                                      dry_run=False, force=True)
         killer.assert_called_once()
 
+class YoloModeTests(unittest.TestCase):
+    """Whatever let an agent act without asking has to survive the resume.
+
+    Each agent spells it differently, and the flag names here were read from
+    each `--help` rather than remembered.
+    """
+
+    SID = "11111111-1111-1111-1111-111111111111"
+
+    def resume(self, agent, *argv):
+        return hibernate.build_resume(agent, self.SID, {"argv": list(argv)},
+                                      "/home/x/proj")
+
+    def test_claude_comes_back_skipping_permissions(self):
+        argv = self.resume("claude", "/home/x/.local/bin/claude",
+                           "--dangerously-skip-permissions")
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertIn(self.SID, argv)
+
+    def test_claude_keeps_an_explicit_permission_mode(self):
+        argv = self.resume("claude", "claude",
+                           "--permission-mode", "bypassPermissions")
+        self.assertEqual(argv[-2:], ["--permission-mode", "bypassPermissions"])
+
+    def test_claude_keeps_the_model_it_was_started_on(self):
+        argv = self.resume("claude", "claude", "--model", "opus")
+        self.assertEqual(argv[-2:], ["--model", "opus"])
+
+    def test_grok_comes_back_auto_approving(self):
+        argv = self.resume("grok", "/home/x/.grok/bin/grok", "--always-approve")
+        self.assertIn("--always-approve", argv)
+
+    def test_grok_keeps_its_sandbox_profile(self):
+        argv = self.resume("grok", "grok", "--sandbox", "readonly")
+        self.assertEqual(argv[-2:], ["--sandbox", "readonly"])
+
+    def test_grok_is_not_handed_cwd_twice(self):
+        argv = self.resume("grok", "grok", "--cwd", "/somewhere/else",
+                           "--always-approve")
+        self.assertEqual(argv.count("--cwd"), 1)
+        self.assertIn("/home/x/proj", argv)
+        self.assertNotIn("/somewhere/else", argv)
+
+    def test_codex_yolo_still_survives(self):
+        argv = self.resume("codex", "codex", "--yolo")
+        self.assertIn("--yolo", argv)
+
+    def test_an_unlisted_flag_is_still_dropped(self):
+        """A stray positional replayed into the resume becomes a prompt."""
+        argv = self.resume("claude", "claude", "--bare", "write me a poem")
+        self.assertNotIn("--bare", argv)
+        self.assertNotIn("write me a poem", argv)
+
+    def test_a_plain_session_gains_nothing(self):
+        self.assertEqual(self.resume("claude", "claude"),
+                         ["claude", "--resume", self.SID])
+
+    def test_every_agent_replays_something_for_its_permission_model(self):
+        for agent, spec in hibernate.AGENTS.items():
+            flags = tuple(spec.get("replay_flags", ())) + \
+                tuple(spec.get("replay_bool_flags", ()))
+            self.assertTrue(
+                any("permission" in f or "approv" in f or "yolo" in f
+                    or "sandbox" in f or "danger" in f for f in flags),
+                "%s replays nothing that governs what it may do" % agent)
+
 
 if __name__ == "__main__":
     unittest.main()

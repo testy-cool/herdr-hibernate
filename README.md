@@ -24,6 +24,11 @@ moment the process exits.
 | Codex CLI | `codex resume <uuid>` | ~550 MB, multi-GB after sub-agent runs |
 | Grok (xAI Grok Build) | `grok --resume <uuid> --cwd <dir>` | ~35 MB plus your MCP servers |
 
+However a session was allowed to act — `--dangerously-skip-permissions`,
+`--yolo`, `--always-approve`, an explicit `--permission-mode` or sandbox
+profile — is read off the process before it is killed and replayed on resume,
+so a pane comes back as permissive as it went to sleep and no more.
+
 Anything else is left alone. Killing a session with no proven way back would
 lose the conversation, so the tool refuses.
 

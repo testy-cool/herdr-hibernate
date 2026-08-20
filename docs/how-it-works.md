@@ -14,16 +14,19 @@ the status is re-checked immediately before the kill.
 
 **Claude Code** — `~/.claude/projects/<project>/<uuid>.jsonl`.
 `claude --resume <uuid>` restores the full conversation.
+`--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`,
+`--permission-mode` and `--model` are replayed from the killed process.
 
 **Codex CLI** — `~/.codex/sessions/<y>/<m>/<d>/rollout-<timestamp>-<uuid>.jsonl`.
 `codex resume <uuid>` appends to the same file and keeps the same id, so the
 mapping stays stable across any number of park/resume cycles. Flags captured
 from the killed process are replayed on resume, including `--model`,
-`--profile`, and the sandbox and approval settings — a resumed session is never
+`--profile`, `--yolo`, and the sandbox and approval settings — a resumed session is never
 *less* restricted than the one that was killed.
 
 **Grok** — `~/.grok/sessions/<encoded-cwd>/<uuid>/`, with `updates.jsonl` as the
-authoritative log. Herdr has no Grok integration and reports no session id, so
+authoritative log. `--always-approve`, `--permission-mode`, `--sandbox` and
+`--model` are replayed; `--cwd` is not, because the resume command sets it. Herdr has no Grok integration and reports no session id, so
 the tool recovers it from Grok's own `active_sessions.json` by matching the
 pane's process pid *and* cwd. Not restored by Grok on resume, by its design
 rather than this tool's: background tasks, plan-mode state, and staged changes
