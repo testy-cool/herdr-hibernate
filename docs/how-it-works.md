@@ -124,6 +124,27 @@ minutes, which is the whole gap being covered, and bounds the one case where
 they lie: a session cleared or forked after being resumed still names the id it
 started with.
 
+### Not re-parking it three seconds later
+
+The opposite mistake is easier to make. A session that has just come back has
+an old last-message timestamp — loading history writes nothing — so the idle
+clock reads the whole length of the park, and the pane qualifies again
+immediately. The guard against that is the agent's own age: nothing can be
+idler than it is old.
+
+Process start time cannot supply that age. The stub hands over with `exec`, so
+the resumed agent inherits the stub's pid *and* its start time, and `/proc`
+reports an agent that returned three seconds ago as being as old as the park.
+The guard silently passed for any pane parked longer than the threshold, which
+is every pane worth parking.
+
+The stub therefore stamps `panes/<pane_id>.awake` in the instant before it
+execs the agent, and the agent's age is the smaller of that marker and what
+`/proc` claims. Taking the smaller of the two keeps both honest: the marker is
+missing for an agent started by hand, and stale for one that replaced a resumed
+session. Markers age out at twice the idle threshold, since no record survives
+a resume to own them.
+
 ## Surviving restarts
 
 The stub is a process, so it dies with Herdr. Three mechanisms bring panes back

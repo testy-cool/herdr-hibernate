@@ -1285,6 +1285,70 @@ class JustResumedSessionTests(unittest.TestCase):
             decision, reason = hibernate.classify(pane, {}, cfg, {}, "")
         self.assertEqual(decision, "hibernate", reason)
 
+class ResumedAgentAgeTests(unittest.TestCase):
+    """How long the agent in a pane has *really* been running.
+
+    A resumed agent replaces the stub with `exec`, inheriting its pid and, with
+    it, its start time. /proc therefore reports a session that came back three
+    seconds ago as being as old as the park, which is exactly the reading the
+    just-resumed guard relies on.
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.paths = mock.patch.multiple(
+            hibernate, CONFIG_DIR=self.tempdir.name,
+            PANES_DIR=os.path.join(self.tempdir.name, "panes"))
+        self.paths.start()
+
+    def tearDown(self):
+        self.paths.stop()
+        self.tempdir.cleanup()
+
+    def test_proc_uptime_alone_is_used_when_nothing_was_marked(self):
+        with mock.patch.object(hibernate, "proc_uptime_minutes",
+                               return_value=120.0):
+            self.assertEqual(hibernate.agent_age_minutes(100, "w1:p1"), 120.0)
+
+    def test_a_marked_resume_beats_the_inherited_start_time(self):
+        hibernate.mark_awake("w1:p1")
+        with mock.patch.object(hibernate, "proc_uptime_minutes",
+                               return_value=357.0):  # the whole park
+            age = hibernate.agent_age_minutes(100, "w1:p1")
+        self.assertLess(age, 1.0)
+
+    def test_an_agent_younger_than_its_marker_is_taken_at_its_word(self):
+        # Pane resumed hours ago, that agent quit, a new one started since.
+        hibernate.mark_awake("w1:p1")
+        os.utime(hibernate.awake_file("w1:p1"),
+                 (time.time() - 7200, time.time() - 7200))
+        with mock.patch.object(hibernate, "proc_uptime_minutes",
+                               return_value=3.0):
+            self.assertEqual(hibernate.agent_age_minutes(100, "w1:p1"), 3.0)
+
+    def test_marker_is_owner_only_because_it_sits_beside_the_stubs(self):
+        hibernate.mark_awake("w1:p1")
+        mode = os.stat(hibernate.awake_file("w1:p1")).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_gc_keeps_a_fresh_marker_but_drops_a_stale_one(self):
+        hibernate.mark_awake("fresh:p1")
+        hibernate.mark_awake("stale:p1")
+        old = time.time() - 3 * 3600
+        os.utime(hibernate.awake_file("stale:p1"), (old, old))
+        hibernate.gc_stub_files({}, 30.0)
+        self.assertTrue(os.path.exists(hibernate.awake_file("fresh:p1")))
+        self.assertFalse(os.path.exists(hibernate.awake_file("stale:p1")))
+
+    def test_gc_never_touches_a_marker_it_cannot_age_out(self):
+        # A stub script for a tracked pane must survive the same sweep.
+        hibernate.mark_awake("w1:p1")
+        os.makedirs(hibernate.PANES_DIR, mode=0o700, exist_ok=True)
+        open(hibernate.pane_file("w1:p1"), "w").close()
+        hibernate.gc_stub_files({"w1:p1": {}}, 30.0)
+        self.assertTrue(os.path.exists(hibernate.pane_file("w1:p1")))
+        self.assertTrue(os.path.exists(hibernate.awake_file("w1:p1")))
+
 
 if __name__ == "__main__":
     unittest.main()

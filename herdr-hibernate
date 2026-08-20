@@ -1302,6 +1302,52 @@ def remove_stub_file(pane_id):
         pass
 
 
+def awake_file(pane_id):
+    """Path of the marker recording when this pane's agent last came back."""
+    return pane_file(pane_id)[:-len(".sh")] + ".awake"
+
+
+def mark_awake(pane_id):
+    """Stamp the moment an agent came back to a pane.
+
+    The stub hands over with `exec`, so the resumed agent inherits the stub's
+    pid *and* its start time: /proc reports a session that returned three
+    seconds ago as being as old as the park. This file's mtime is the only
+    honest record of when the agent actually started, and the just-resumed
+    guard is worthless without it.
+    """
+    path = awake_file(pane_id)
+    try:
+        os.makedirs(PANES_DIR, mode=0o700, exist_ok=True)
+        with open(path, "w"):
+            pass
+        os.chmod(path, 0o600)  # it sits among the stubs, which hold conversation
+        os.utime(path, None)
+    except OSError:
+        pass
+
+
+def awake_minutes(pane_id):
+    """Minutes since this pane's agent came back, or None if never recorded."""
+    try:
+        return max(0.0, (time.time() - os.path.getmtime(awake_file(pane_id)))
+                   / 60.0)
+    except OSError:
+        return None
+
+
+def agent_age_minutes(pid, pane_id):
+    """How long the agent in a pane has really been running.
+
+    Neither source is trustworthy alone. /proc over-reports after a resume, and
+    the marker is missing for an agent the user started by hand or one that
+    replaced a resumed session. Whichever is smaller is the safe answer.
+    """
+    ages = [a for a in (proc_uptime_minutes(pid), awake_minutes(pane_id))
+            if a is not None]
+    return min(ages) if ages else None
+
+
 def stub_command(pane_id, info=None, plain=False):
     """Command that arms the pane's stub as a CHILD of the pane shell.
 
@@ -1635,8 +1681,8 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
 
     # A session resumed a moment ago still has an old last-message timestamp
     # (loading history writes nothing), so it looks ancient. It cannot be idler
-    # than its own process is old.
-    up = proc_uptime_minutes(pid)
+    # than its own agent is old.
+    up = agent_age_minutes(pid, pane_id)
     threshold = float(cfg["HIBERNATE_AFTER_MINUTES"])
     if not force and up is not None and up < threshold:
         log("SKIP %s (%s): %s only started %s ago (likely just resumed)" % (
@@ -1715,14 +1761,29 @@ def forget_record(pane_id, state, why):
                                 pane_id, why))
 
 
-def gc_stub_files(state):
-    """Delete stub scripts that no longer belong to a tracked pane."""
+def gc_stub_files(state, threshold=None):
+    """Delete stub scripts that no longer belong to a tracked pane.
+
+    Resume markers belong to no record by design — the record is gone by the
+    time one is written — so they age out instead, well past the point where
+    the just-resumed guard would still consult them.
+    """
+    if threshold is None:
+        threshold = float(load_config()["HIBERNATE_AFTER_MINUTES"])
     expected = {os.path.basename(pane_file(p)) for p in state}
     try:
         names = os.listdir(PANES_DIR)
     except OSError:
         return
     for name in names:
+        if name.endswith(".awake"):
+            path = os.path.join(PANES_DIR, name)
+            try:
+                if (time.time() - os.path.getmtime(path)) / 60.0 > threshold * 2:
+                    os.remove(path)
+            except OSError:
+                pass
+            continue
         if name.endswith(".sh") and name not in expected:
             try:
                 os.remove(os.path.join(PANES_DIR, name))
@@ -1826,6 +1887,8 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                 if not restore_owned_agent_name(pane_id, pane, rec):
                     continue
                 log("RESUMED %s (%s)" % (label, pane_id), echo=False)
+                if awake_minutes(pane_id) is None:
+                    mark_awake(pane_id)
                 del state[pane_id]
                 remove_stub_file(pane_id)
                 save_state(state)
@@ -2177,6 +2240,8 @@ def cmd_forget(pane_id, resumed=False):
     rec = state.pop(pane_id, None)
     save_state(state)
     remove_stub_file(pane_id)
+    if resumed and awake_minutes(pane_id) is None:
+        mark_awake(pane_id)
     if rec:
         log("%s %s (%s)" % ("RESUMED" if resumed else "FORGOT",
                             rec.get("label", "?"), pane_id), echo=not resumed)
@@ -2186,6 +2251,10 @@ def cmd_forget(pane_id, resumed=False):
 
 def cmd_label_awake(pane_id):
     """Restore this record's exact tool-owned tab label without clearing state."""
+    # The stub runs this in the pane immediately before it execs the agent, so
+    # it is the most accurate resume moment there is. Stamp it whatever else
+    # happens below, because the agent starts either way.
+    mark_awake(pane_id)
     state = load_state()
     rec = state.get(pane_id)
     if not rec:
@@ -2300,7 +2369,7 @@ def cmd_status():
                 pid = None
             if pid:
                 info = pane_process_info(pane_id)
-                up = proc_uptime_minutes(pid)
+                up = agent_age_minutes(pid, pane_id)
                 if info and pid == info.get("shell_pid"):
                     tag = "PROTECTED — %s is the pane's shell" % agent
                 elif up is not None and up < float(threshold):
