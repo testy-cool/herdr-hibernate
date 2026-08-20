@@ -1180,13 +1180,48 @@ class StubExcerptTests(unittest.TestCase):
         _, out = self.render("q", "a", cwd=os.path.expanduser("~/Work/thing"))
         self.assertIn("~/Work/thing", ANSI_RE.sub("", out))
 
+    def _banner_block(self, out):
+        """The banner and subtitle lines, as printed."""
+        lines = ANSI_RE.sub("", out).splitlines()
+        first = next(i for i, l in enumerate(lines) if "hibernated" in l)
+        last = next(i for i, l in enumerate(lines) if "plain shell" in l)
+        return lines[first:last + 1]
+
     def test_the_banner_and_subtitle_wrap_instead_of_running_off(self):
-        _, out = self.render("q", "a", columns="40",
-                             cwd="/very/long/path/" + "seg/" * 12)
-        plain = ANSI_RE.sub("", out)
-        banner = plain[plain.index("hibernated"):plain.index("plain shell")]
-        for line in banner.splitlines():
+        block = self._banner_block(self.render(
+            "q", "a", columns="40", cwd="/very/long/path/" + "seg/" * 12)[1])
+        for line in block:
             self.assertLessEqual(len(line), 40, line)
+
+    def test_wrapped_lines_hang_under_the_first_instead_of_column_zero(self):
+        """A continuation flush against the left margin is what looked broken."""
+        block = self._banner_block(self.render(
+            "q", "a", columns="40", cwd="/very/long/path/" + "seg/" * 12)[1])
+        self.assertGreater(len(block), 1, "expected this to wrap at 40 columns")
+        self.assertTrue(block[0].startswith("  \U0001f4a4"), block[0])
+        for line in block[1:]:
+            self.assertTrue(line.startswith("     "), repr(line))
+            self.assertNotEqual(line[5:6], " ", repr(line))
+
+    def test_the_block_starts_on_the_same_margin_as_the_excerpt(self):
+        lines = ANSI_RE.sub("", self.render("q", "a")[1]).splitlines()
+        excerpt = next(l for l in lines if "you" in l)
+        banner = next(l for l in lines if "hibernated" in l)
+        self.assertEqual(len(excerpt) - len(excerpt.lstrip()),
+                         len(banner) - len(banner.lstrip()))
+
+    def test_a_group_that_fits_is_never_split_across_lines(self):
+        """Folding as prose broke `Ctrl-C for a plain shell` mid-phrase."""
+        block = self._banner_block(self.render(
+            "q", "a", columns="56", cwd="/home/x/Work/dpf-store-policy-scraper")[1])
+        self.assertTrue(any(l.strip() == "Ctrl-C for a plain shell" for l in block),
+                        block)
+        self.assertTrue(any(l.strip() == "press Enter to resume" for l in block),
+                        block)
+
+    def test_nothing_wraps_at_all_in_a_wide_pane(self):
+        block = self._banner_block(self.render("q", "a", columns="110")[1])
+        self.assertEqual(len(block), 2, block)
 
     def test_the_hand_resume_command_is_never_wrapped(self):
         """Folding it would put a newline through a command meant to be copied."""

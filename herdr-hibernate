@@ -1136,13 +1136,42 @@ _hb_cols() {{
     case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
     printf '%s' "$cols"
 }}
-_hb_fold() {{  # $1 colour prefix, $2 text — wrapped to the full pane width
-    local width=$(( $(_hb_cols) - 1 )) line
-    [ "$width" -lt 30 ] && width=30
-    printf '%s\\n' "$2" | fold -s -w "$width" 2>/dev/null | while IFS= read -r line
-    do
-        printf '%b%s\\033[0m\\n' "$1" "$line"  # %b so the colour is a colour
-    done
+# The banner block is a list of ' · ' groups, not a paragraph. Folding it as
+# prose splits phrases mid-word and drops the continuation at column 0, so it
+# is packed instead: groups stay whole, and a line that will not fit starts a
+# new one under a hanging indent that lines the block up with the excerpt.
+_hb_pack() {{  # $1 colour, $2 first indent, $3 hanging indent, $4 text
+    local colour=$1 ind=$2 hang=$3 text=$4
+    local width=$(( $(_hb_cols) - 2 )) line='' seg sub cand avail
+    [ "$width" -lt 24 ] && width=24
+    _hb_emit() {{
+        printf '%b%s%s\\033[0m\\n' "$colour" "$ind" "$1"  # %b so the colour is a colour
+        ind=$hang
+    }}
+    while IFS= read -r seg; do
+        [ -z "$seg" ] && continue
+        avail=$(( width - ${{#ind}} ))
+        [ "$avail" -lt 16 ] && avail=16
+        if [ -z "$line" ]; then cand=$seg; else cand="$line · $seg"; fi
+        if [ "${{#cand}}" -le "$avail" ]; then
+            line=$cand
+            continue
+        fi
+        if [ -n "$line" ]; then
+            _hb_emit "$line"
+            line=''
+            avail=$(( width - ${{#ind}} ))
+            [ "$avail" -lt 16 ] && avail=16
+        fi
+        # a single group wider than the pane still has to be folded
+        while IFS= read -r sub; do
+            [ -n "$line" ] && _hb_emit "$line"
+            line=$sub
+        done < <(printf '%s\\n' "$seg" | fold -s -w "$avail" 2>/dev/null)
+    done < <(printf '%s\\n' "$text" | sed 's/ · /\\n/g')
+    [ -n "$line" ] && _hb_emit "$line"
+    unset -f _hb_emit
+    return 0
 }}
 _hb_turn() {{  # $1 speaker, $2 text, $3 max lines (0 = all), $4 label column
     [ -z "$2" ] && return 0
@@ -1181,8 +1210,8 @@ _hb_stub() {{
     # still be visible next to the cursor.
     {excerpt}
     printf '\\n'
-    _hb_fold '\\033[1;35m' {banner}
-    _hb_fold '\\033[2m' {subtitle}
+    _hb_pack '\\033[1;35m' '  ' '     ' {banner}
+    _hb_pack '\\033[2m' '     ' '     ' {subtitle}
     printf '\\n'
     IFS= read -r _ || return 0
     printf 'resuming session %s (takes 10-20s)...\\n' {uuid}
@@ -1241,7 +1270,7 @@ def resume_argv(rec):
 def write_stub_file(pane_id, rec):
     """(Re)write the pane's stub script from its state record. Returns its path."""
     os.makedirs(PANES_DIR, mode=0o700, exist_ok=True)
-    banner = "💤 hibernated %s ago (freed ~%dMB) — press Enter to resume" % (
+    banner = "💤 hibernated %s ago · freed ~%dMB · press Enter to resume" % (
         since_str(rec.get("at", "")), rec.get("freed_mb", 0))
     agent = rec.get("agent", "claude")
     # Short id and a ~-relative path: the full uuid wrapped this line onto a

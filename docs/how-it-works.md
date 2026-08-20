@@ -100,6 +100,12 @@ so the stub reprints the tail of the conversation from the transcript instead.
 - **Wrapping happens when the stub prints**, so a pane resized long after
   parking still lines up. The banner sits *below* the excerpt so that
   `press Enter to resume` stays next to the cursor.
+- **The banner block is packed, not folded.** It is a list of `·` groups
+  rather than a paragraph, so folding it as prose split phrases mid-word and
+  dropped the continuation at column 0. Groups stay whole, a line that will
+  not fit starts a new one, and the block hangs under a shared indent that
+  lines it up with the excerpt above. Only a single group wider than the pane
+  is folded.
 - Slash commands, hook output, task notifications, compaction handoffs and
   sub-agent turns are not the human talking and are skipped. Codex's
   memory-citation markup and markdown link targets are dropped for the same
