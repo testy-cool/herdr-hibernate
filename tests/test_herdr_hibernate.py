@@ -1142,6 +1142,102 @@ class RecentTurnsTests(unittest.TestCase):
 
         self.assertEqual(turns[-1], ("agent", "reply 8"))
 
+    def test_a_run_of_tool_calls_becomes_one_marker(self):
+        with self.write([
+            {"type": "user", "message": {"role": "user", "content": "fix it"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Read"},
+                {"type": "tool_use", "name": "Edit"}]}},
+            {"type": "user", "toolUseResult": {"ok": 1},
+             "message": {"role": "user", "content": "result"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Bash"}]}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Fixed."}]}},
+        ]):
+            self.assertEqual(hibernate.recent_turns("sid", "claude", 0), [
+                ("user", "fix it"), ("tools", "3"), ("agent", "Fixed.")])
+
+    def test_a_reply_that_also_calls_tools_keeps_its_words_first(self):
+        """The marker belongs under the sentence, not above it."""
+        with self.write([
+            {"type": "user", "message": {"role": "user", "content": "go"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "I will look."},
+                {"type": "tool_use", "name": "Grep"}]}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Found it."}]}},
+        ]):
+            self.assertEqual(hibernate.recent_turns("sid", "claude", 0), [
+                ("user", "go"), ("agent", "I will look."),
+                ("tools", "1"), ("agent", "Found it.")])
+
+    def test_a_pane_parked_mid_job_ends_on_its_marker(self):
+        with self.write([
+            {"type": "user", "message": {"role": "user", "content": "build it"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Bash"},
+                {"type": "tool_use", "name": "Bash"}]}},
+        ]):
+            self.assertEqual(hibernate.recent_turns("sid", "claude", 0),
+                             [("user", "build it"), ("tools", "2")])
+
+    def test_markers_never_reach_the_exchange_view(self):
+        """The default excerpt looks exactly as it did before markers existed."""
+        with self.write([
+            {"type": "user", "message": {"role": "user", "content": "why 404"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Read"}]}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Bad rewrite rule."}]}},
+        ]):
+            self.assertEqual(hibernate.last_exchange("sid", "claude"),
+                             [("user", "why 404"), ("agent", "Bad rewrite rule.")])
+
+    def test_a_marker_never_opens_the_excerpt(self):
+        """Sliced to N turns, a leading '3 tool calls' has nothing to explain it."""
+        entries = [
+            {"type": "user", "message": {"role": "user", "content": "one"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Read"}]}},
+            {"type": "assistant", "message": {"role": "assistant",
+                                              "content": [{"type": "text",
+                                                           "text": "two"}]}},
+        ]
+        with self.write(entries):
+            self.assertEqual(hibernate.recent_turns("sid", "claude", 1),
+                             [("agent", "two")])
+
+    def test_pi_counts_its_camelcase_tool_calls(self):
+        turns = hibernate._pi_turns([
+            {"type": "message", "message": {"role": "user",
+                                            "content": "ship it"}},
+            {"type": "message", "message": {"role": "assistant", "content": [
+                {"type": "toolCall", "name": "bash"},
+                {"type": "thinking", "text": "hmm"},
+                {"type": "toolCall", "name": "edit"}]}},
+            {"type": "message", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Shipped."}]}},
+        ])
+
+        self.assertEqual(turns, [("user", "ship it"), ("tools", "2"),
+                                 ("agent", "Shipped.")])
+
+    def test_codex_counts_every_tool_family_but_not_its_results(self):
+        turns = hibernate._codex_turns([
+            {"payload": {"type": "message", "role": "user",
+                         "content": [{"text": "run the suite"}]}},
+            {"payload": {"type": "custom_tool_call"}},
+            {"payload": {"type": "function_call"}},
+            {"payload": {"type": "custom_tool_call_output"}},
+            {"payload": {"type": "reasoning"}},
+            {"payload": {"type": "message", "role": "assistant",
+                         "content": [{"text": "All green."}]}},
+        ])
+
+        self.assertEqual(turns, [("user", "run the suite"), ("tools", "2"),
+                                 ("agent", "All green.")])
+
     def test_the_stub_follows_the_configured_mode(self):
         entries = [e for n in range(20) for e in self.exchange(n)]
         with self.write(entries):

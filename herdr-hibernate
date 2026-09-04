@@ -643,9 +643,22 @@ def reflow(text):
     return "\n".join(line for line in lines if line.strip()).replace("`", "")
 
 
+def _flush_tools(turns, tools):
+    """Close a run of tool calls with a marker row. Returns the reset count.
+
+    The row is ("tools", "14"), not a turn anybody took: it says the agent went
+    away and did fourteen things here, without saying what they were. Counting
+    is deliberate — the content of a tool call is where the file paths, command
+    lines and pasted keys live, and none of that belongs in a stub on disk.
+    """
+    if tools:
+        turns.append(("tools", str(tools)))
+    return 0
+
+
 def _claude_turns(objects):
     """Every real turn in a Claude Code transcript, oldest first."""
-    turns = []
+    turns, tools = [], 0
     for obj in objects:
         kind = obj.get("type")
         if kind not in ("user", "assistant") or obj.get("isSidechain"):
@@ -654,23 +667,31 @@ def _claude_turns(objects):
                                or obj.get("toolUseResult") is not None):
             continue
         content = (obj.get("message") or {}).get("content")
+        called = 0
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
             text = " ".join(block.get("text", "") for block in content
                             if isinstance(block, dict)
                             and block.get("type") == "text")
+            called = sum(1 for block in content if isinstance(block, dict)
+                         and block.get("type") == "tool_use")
         else:
             continue
         text = _clean_turn_text(text)
         if text:
+            tools = _flush_tools(turns, tools)
             turns.append(("user" if kind == "user" else "agent", text))
+        # After the turn, not before: one message can say "I will fix that" and
+        # then call three tools, and the marker belongs under that sentence.
+        tools += called
+    _flush_tools(turns, tools)  # a pane parked mid-job ends on its marker
     return turns
 
 
 def _pi_turns(objects):
     """Every real turn in a pi transcript, oldest first."""
-    turns = []
+    turns, tools = [], 0
     for obj in objects:
         if obj.get("type") != "message":
             continue
@@ -679,6 +700,7 @@ def _pi_turns(objects):
         if role not in ("user", "assistant"):
             continue
         content = message.get("content")
+        called = 0
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
@@ -687,20 +709,34 @@ def _pi_turns(objects):
             text = " ".join(block.get("text", "") for block in content
                             if isinstance(block, dict)
                             and block.get("type") == "text")
+            called = sum(1 for block in content if isinstance(block, dict)
+                         and block.get("type") == "toolCall")
         else:
             continue
         text = _clean_turn_text(text)
         if text:
+            tools = _flush_tools(turns, tools)
             turns.append(("user" if role == "user" else "agent", text))
+        tools += called
+    _flush_tools(turns, tools)
     return turns
 
 
 def _codex_turns(objects):
     """Every real turn in a Codex rollout file, oldest first."""
-    turns = []
+    turns, tools = [], 0
     for obj in objects:
         payload = obj.get("payload")
-        if not isinstance(payload, dict) or payload.get("type") != "message":
+        if not isinstance(payload, dict):
+            continue
+        kind = payload.get("type")
+        if kind != "message":
+            # Codex names every tool family separately (custom_tool_call,
+            # function_call, local_shell_call) and has renamed them before, so
+            # the suffix is matched rather than a list kept current by hand.
+            # `_call_output` is the result coming back, not a second call.
+            if isinstance(kind, str) and kind.endswith("_call"):
+                tools += 1
             continue
         role = payload.get("role")
         blocks = payload.get("content")
@@ -710,7 +746,9 @@ def _codex_turns(objects):
             block.get("text", "") for block in blocks
             if isinstance(block, dict)))
         if text:
+            tools = _flush_tools(turns, tools)
             turns.append(("user" if role == "user" else "agent", text))
+    _flush_tools(turns, tools)
     return turns
 
 
@@ -723,6 +761,7 @@ def tail_exchange(turns):
     exchange behind it is the part that identifies the pane, and the unanswered
     prompt on the end is what the agent was about to do, so both are shown.
     """
+    turns = [turn for turn in turns if turn[0] != "tools"]
     trailing = []
     if turns and turns[-1][0] == "user":
         trailing = [turns[-1]]
@@ -1369,6 +1408,11 @@ _hb_turn() {{  # $1 speaker, $2 text, $3 max lines (0 = all), $4 label column
         shown=$(( shown + 1 ))
     done <<< "$wrapped"
 }}
+_hb_mark() {{  # $1 how many tool calls happened here, $2 label column
+    local word=calls
+    [ "$1" = 1 ] && word=call
+    printf "  [2m%-$2s · %s tool %s ·[0m\n" '' "$1" "$word"
+}}
 # This script must always run as a CHILD of the pane's shell, never replace it
 # (no `exec bash <this>`). claude then ends up a child too, so killing claude at
 # the next hibernation leaves the pane's shell alive. If claude were the pane
@@ -1506,6 +1550,12 @@ def render_excerpt(turns, label):
     pad = str(max(3, len(label)))
     lines = ["printf '\\n'"]
     for role, text in turns:
+        if role == "tools":
+            # What the agent did between two replies, as a count. It keeps a
+            # long reply from reading as an instant answer, and it is the only
+            # thing here that is not something one of you said.
+            lines.append("_hb_mark %s %s" % (shlex.quote(text), pad))
+            continue
         lines.append("_hb_turn %s %s %s %s" % (
             shlex.quote("you" if role == "user" else label),
             shlex.quote(text), _excerpt_lines, pad))
