@@ -133,7 +133,7 @@ never overwritten.
 | `HIBERNATE_AFTER_MINUTES` | `30` | Idle minutes before a pane qualifies. Raise above 60 if you use scheduled wake-ups. |
 | `DRY_RUN` | `1` | `1` = log only. Set `0` to arm it. |
 | `PIN_MARKER` | `📌` | Any tab or pane label containing this is never parked. |
-| `EXCERPT_TURNS` | `exchange` | How far back a parked pane reprints. A number reprints that many recent turns so you can scroll the session; `all` reprints everything. |
+| `EXCERPT_TURNS` | `exchange` | How far back a parked pane reprints. A number reprints that many recent turns so you can scroll the session; `all` reprints everything. Never reads past the last 64MB of a transcript. |
 | `EXCERPT_LINES` | `all` | `all` reprints each turn in full. A number caps each turn; `0` hides the excerpt. |
 | `SCAN_INTERVAL_SECONDS` | `120` | Delay between scans in `watch` mode. |
 | `KILL_GRACE_SECONDS` | `5` | Wait after SIGTERM before SIGKILL. |

@@ -214,8 +214,12 @@ CONFIG_KEYS = [
      "last prompt and its reply, which is enough to recognise a pane at a\n"
      "glance. A number reprints that many of the most recent turns instead, so\n"
      "you can scroll back through the session without resuming it, and `all`\n"
-     "reprints everything. Pair a large value with a small EXCERPT_LINES: forty\n"
-     "turns printed whole is a lot of pane.\n"
+     "reprints everything it read. Pair a large value with a small\n"
+     "EXCERPT_LINES: forty turns printed whole is a lot of pane.\n"
+     "A read never goes further back than the last 64MB of a transcript, so on\n"
+     "a very large one `all` means as much as that held, and the rule above\n"
+     "the conversation says how many turns it is rather than claiming to be\n"
+     "the whole thing.\n"
      "NOTE: whatever is reprinted is written to ~/.config/herdr-hibernate/panes/,\n"
      "so a larger value puts more of the conversation on disk. That is why\n"
      "those scripts are owner-only."),
@@ -529,10 +533,20 @@ EXCERPT_TAIL_BYTES = 1024 * 1024
 EXCERPT_WIDE_TAIL_BYTES = 12 * 1024 * 1024
 # Under 2% of a large transcript is anything anybody said; the rest is tool
 # traffic. So reading back for N turns widens in steps instead of parsing tens
-# of megabytes to find forty of them. Measured on two sessions over 50MB, the
-# first window already held 50 and 34 turns. The last window is the whole file.
+# of megabytes to find forty of them. Measured on two Claude sessions over
+# 50MB, the first window already held 50 and 34 turns.
+#
+# The ladder stops at a ceiling instead of falling through to the whole file,
+# because "the whole file" is not a bounded amount of work here: the largest
+# Codex rollout on the machine this was written on is 1.03GB and takes 6.2s to
+# parse, inside the scan loop, while the pane it is for sits unparked. Reading
+# its last 64MB costs 0.42s and yields 289 turns, which is far more than
+# anybody reads. The 32MB rung exists because 12MB of that rollout held 37
+# turns against a request for 40, and missing by three bought the whole
+# gigabyte.
+TURN_READ_CEILING = 64 * 1024 * 1024
 TURN_WINDOWS = (EXCERPT_TAIL_BYTES, 4 * EXCERPT_TAIL_BYTES,
-                EXCERPT_WIDE_TAIL_BYTES, float("inf"))
+                EXCERPT_WIDE_TAIL_BYTES, 32 * 1024 * 1024, TURN_READ_CEILING)
 
 # Pseudo-user entries: hooks, slash-command wrappers, background task results
 # and skill injections all arrive as role "user". None of them is something the
@@ -818,7 +832,10 @@ def recent_turns(uuid, agent="claude", count=0):
     """The last `count` turns of a session, or the whole thing when count is 0.
 
     Same [(role, text)] shape as last_exchange, including the synthetic "tools"
-    rows, so both feed the stub renderer unchanged.
+    rows, so both feed the stub renderer unchanged. A leading ("cut", "") row
+    means the session starts above what is returned, whether because `count`
+    trimmed it or because the read stopped at TURN_READ_CEILING. It is what
+    stops the heading claiming to show a whole conversation it never read.
     """
     path = _transcript_path(uuid, agent)
     if path is None:
@@ -838,12 +855,17 @@ def recent_turns(uuid, agent="claude", count=0):
             # Count only real speech: a window full of tool markers and no
             # conversation is exactly the case widening exists to fix.
             said = sum(1 for role, _ in turns if role != "tools")
-            if window >= size or (count and said >= count):
+            whole = window >= size
+            if whole or (count and said >= count):
                 break
     except Exception:  # a transcript schema change must never block a stub
         return []
     if count:
-        turns = _last_turns(turns, count)
+        trimmed = _last_turns(turns, count)
+        whole = whole and len(trimmed) == len(turns)
+        turns = trimmed
+    if not whole:
+        turns = [("cut", "")] + turns
     _turns_cache[uuid] = (stamp, turns)
     return turns
 
@@ -1565,18 +1587,22 @@ def tilde(path):
     return "~" + path[len(home):] if path.startswith(home) else path
 
 
-def _excerpt_heading(said):
+def _excerpt_heading(turns):
     """What the rule above the conversation says it is showing, or "".
 
     Standing at the top of the block, the one thing you cannot work out for
-    yourself is whether anything is missing above it. The default excerpt gets
-    no rule at all: two lines do not need framing, and never had one.
+    yourself is whether anything is missing above it, so the reader is told
+    rather than left to infer it from a turn count. It is read off the "cut"
+    row rather than guessed from the count asked for, because a read that
+    stopped at the ceiling also has more above it and looks identical from
+    here. The default excerpt gets no rule at all: two lines do not need
+    framing, and never had one.
     """
-    mode, count = _excerpt_turns
-    if mode == "exchange":
+    if _excerpt_turns[0] == "exchange":
         return ""
-    if mode == "all" or said < count:
+    if not any(role == "cut" for role, _ in turns):
         return "💤 parked · the whole conversation"
+    said = sum(1 for role, _ in turns if role not in ("tools", "cut"))
     return "💤 parked · the last %d turns" % said
 
 
@@ -1585,7 +1611,7 @@ def render_excerpt(turns, label):
     if not turns:
         return ":"  # nothing to say; keep the template a valid statement
     pad = str(max(3, len(label)))
-    heading = _excerpt_heading(sum(1 for role, _ in turns if role != "tools"))
+    heading = _excerpt_heading(turns)
     # The newline first: a killed agent can leave the cursor mid-line, and the
     # rule is the one thing here that has to start at column zero to read as a
     # rule at all.
@@ -1593,6 +1619,8 @@ def render_excerpt(turns, label):
     if heading:
         lines += ["_hb_rule %s" % shlex.quote(heading), "printf '\\n'"]
     for role, text in turns:
+        if role == "cut":
+            continue  # a fact for the heading, not a line of its own
         if role == "tools":
             # What the agent did between two replies, as a count. It keeps a
             # long reply from reading as an instant answer, and it is the only
@@ -2126,6 +2154,9 @@ def forget_record(pane_id, state, why):
         # the now-useless record.
         restore_owned_workspace_label(pane_id, rec, state)
     rec = state.pop(pane_id, None)
+    if rec:
+        # "Everything this tool knows" includes the turns read for its stub.
+        _turns_cache.pop(rec.get("uuid"), None)
     save_state(state)
     remove_stub_file(pane_id)
     log("FORGOT %s (%s): %s" % (rec.get("label", "?") if rec else "?",
@@ -2260,6 +2291,9 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                 log("RESUMED %s (%s)" % (label, pane_id), echo=False)
                 if awake_minutes(pane_id) is None:
                     mark_awake(pane_id)
+                # A live session's transcript grows again, so its parked
+                # reading is both stale and no longer anybody's to hold.
+                _turns_cache.pop(rec.get("uuid"), None)
                 del state[pane_id]
                 remove_stub_file(pane_id)
                 save_state(state)

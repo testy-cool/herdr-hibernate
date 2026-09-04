@@ -1087,6 +1087,7 @@ class RecentTurnsTests(unittest.TestCase):
             turns = hibernate.recent_turns("sid", "claude", 6)
 
         self.assertEqual(turns, [
+            ("cut", ""),  # the session starts above this
             ("user", "prompt 27"), ("agent", "reply 27"),
             ("user", "prompt 28"), ("agent", "reply 28"),
             ("user", "prompt 29"), ("agent", "reply 29")])
@@ -1113,9 +1114,11 @@ class RecentTurnsTests(unittest.TestCase):
         with self.write(entries):
             turns = hibernate.recent_turns("sid", "claude", 20)
 
-        self.assertEqual(len(turns), 20)
+        self.assertEqual(sum(1 for role, _ in turns if role == "user"
+                             or role == "agent"), 20)
         self.assertEqual(turns[-1], ("agent", "reply 99"))
-        self.assertEqual(turns[0], ("user", "prompt 31"))
+        self.assertEqual(turns[0], ("cut", ""))
+        self.assertEqual(turns[1], ("user", "prompt 31"))
 
     def test_an_unchanged_transcript_is_only_read_once(self):
         """A parked agent is dead, so its transcript cannot move under us.
@@ -1131,6 +1134,33 @@ class RecentTurnsTests(unittest.TestCase):
 
         never.assert_not_called()
         self.assertEqual(first, second)
+
+    def test_asking_for_more_turns_is_not_served_from_the_memo(self):
+        """EXCERPT_TURNS is re-read every scan, so the count can change.
+
+        The file has not moved, so mtime and size alone would call this a hit
+        and hand back a four-turn answer to a request for ten.
+        """
+        entries = [e for n in range(9) for e in self.exchange(n)]
+        with self.write(entries):
+            hibernate.recent_turns("sid", "claude", 4)
+            wider = hibernate.recent_turns("sid", "claude", 10)
+
+        self.assertEqual(
+            sum(1 for role, _ in wider if role in ("user", "agent")), 10)
+
+    def test_the_read_stops_at_the_ceiling_and_says_so(self):
+        """A 1GB Codex rollout is 6.2s to parse whole, inside the scan loop."""
+        entries = [self.padding(64) for _ in range(4)] + [
+            e for n in range(3) for e in self.exchange(n)]
+        with self.write(entries):
+            with mock.patch.object(hibernate, "TURN_WINDOWS", (1024,)):
+                turns = hibernate.recent_turns("sid", "claude", 40)
+
+        self.assertEqual(turns[0], ("cut", ""))
+        with mock.patch.object(hibernate, "_excerpt_turns", ("all", 0)):
+            # Never "the whole conversation" for a file it stopped reading.
+            self.assertIn("the last", hibernate._excerpt_heading(turns))
 
     def test_a_rewritten_transcript_is_read_again(self):
         """The first rewrite after a resume has to see the new turns."""
@@ -1206,7 +1236,7 @@ class RecentTurnsTests(unittest.TestCase):
         ]
         with self.write(entries):
             self.assertEqual(hibernate.recent_turns("sid", "claude", 1),
-                             [("agent", "two")])
+                             [("cut", ""), ("agent", "two")])
 
     def test_harness_chatter_is_not_something_you_said(self):
         """Both of these were 17 of 80 turns across two real sessions."""
@@ -1257,13 +1287,18 @@ class RecentTurnsTests(unittest.TestCase):
     def test_the_stub_follows_the_configured_mode(self):
         entries = [e for n in range(20) for e in self.exchange(n)]
         with self.write(entries):
-            with mock.patch.object(hibernate, "_excerpt_turns",
-                                   ("exchange", 0)):
-                self.assertEqual(len(hibernate._stub_turns("sid", "claude")), 2)
-            with mock.patch.object(hibernate, "_excerpt_turns", ("turns", 8)):
-                self.assertEqual(len(hibernate._stub_turns("sid", "claude")), 8)
-            with mock.patch.object(hibernate, "_excerpt_turns", ("all", 0)):
-                self.assertEqual(len(hibernate._stub_turns("sid", "claude")), 40)
+            def said(mode):
+                with mock.patch.object(hibernate, "_excerpt_turns", mode):
+                    rows = hibernate._stub_turns("sid", "claude")
+                return [r for r in rows if r[0] not in ("tools", "cut")], rows
+
+            self.assertEqual(len(said(("exchange", 0))[0]), 2)
+            spoken, rows = said(("turns", 8))
+            self.assertEqual(len(spoken), 8)
+            self.assertIn(("cut", ""), rows)   # 40 turns exist, 8 are shown
+            spoken, rows = said(("all", 0))
+            self.assertEqual(len(spoken), 40)
+            self.assertNotIn(("cut", ""), rows)  # nothing above it
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -1361,8 +1396,10 @@ class StubExcerptTests(unittest.TestCase):
         few = self.browse([("user", "one"), ("agent", "two")])
         self.assertIn("the whole conversation", few)
 
-        many = self.browse([("agent", "t%d" % n) for n in range(40)])
+        many = self.browse([("cut", "")]
+                           + [("agent", "t%d" % n) for n in range(40)])
         self.assertIn("the last 40 turns", many)
+        self.assertNotIn("the whole conversation", many)
 
     def test_the_default_excerpt_is_never_framed(self):
         """Two lines do not need a frame, and have never had one."""
