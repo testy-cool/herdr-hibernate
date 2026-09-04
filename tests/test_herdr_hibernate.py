@@ -1306,11 +1306,70 @@ class StubExcerptTests(unittest.TestCase):
         self.assertLess(out.index("The rewrite rule was wrong."),
                         out.index("press Enter to resume"))
 
-    def test_the_excerpt_is_dim(self):
-        """Dim is the whole point: present, but not competing with live output."""
+    def test_the_speaker_is_dim_and_the_words_are_not(self):
+        """Dim marks a pane as parked. It must not make it hard to read.
+
+        Forty turns of low-contrast grey is a different proposition from four
+        lines of it, and the words are what you scrolled back for.
+        """
         _, out = self.render("a question", "an answer")
-        self.assertIn("\x1b[2myou", out)
-        self.assertIn("a question\x1b[0m", out)
+        self.assertIn("\x1b[2myou", out)            # the speaker is dim
+        self.assertIn("\x1b[0m a question", out)    # the words are not
+        self.assertNotIn("a question\x1b[0m", out)
+
+    def browse(self, turns, mode=("turns", 40), columns="80"):
+        """Render a stub the way a browsable parked pane renders one."""
+        rec = dict(self.rec)
+        with mock.patch.object(hibernate, "_excerpt_turns", mode):
+            with mock.patch.object(hibernate, "recent_turns",
+                                   return_value=turns):
+                path = hibernate.write_stub_file("w1:p1", rec)
+        syntax = subprocess.run(["bash", "-n", path], capture_output=True,
+                                text=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        return subprocess.run(["bash", path], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True,
+                              env=dict(os.environ, COLUMNS=columns,
+                                       TERM="dumb")).stdout
+
+    def test_a_browsable_pane_is_framed_top_and_bottom(self):
+        out = self.browse([("user", "one"), ("agent", "two")])
+
+        rules = [line for line in out.splitlines() if "─" in line]
+        self.assertEqual(len(rules), 2)
+        self.assertLess(out.index("─"), out.index("one"))
+        self.assertLess(out.rindex("two"), out.rindex("─"))
+
+    def test_the_frame_says_whether_anything_is_missing_above_it(self):
+        """Standing at the top, that is the one thing you cannot work out."""
+        few = self.browse([("user", "one"), ("agent", "two")])
+        self.assertIn("the whole conversation", few)
+
+        many = self.browse([("agent", "t%d" % n) for n in range(40)])
+        self.assertIn("the last 40 turns", many)
+
+    def test_the_default_excerpt_is_never_framed(self):
+        """Two lines do not need a frame, and have never had one."""
+        _, out = self.render("a question", "an answer")
+        self.assertNotIn("─", out)
+
+    def test_tool_calls_print_as_a_count_and_never_as_a_speaker(self):
+        out = self.browse([("user", "fix it"), ("tools", "14"),
+                           ("agent", "Fixed."), ("tools", "1")])
+
+        self.assertIn("· 14 tool calls ·", out)
+        self.assertIn("· 1 tool call ·", out)
+        self.assertNotIn("tools", out)
+        self.assertLess(out.index("· 14 tool calls ·"), out.index("Fixed."))
+
+    def test_a_wall_of_turns_still_writes_a_valid_script(self):
+        """Forty turns of arbitrary human text go into a bash script verbatim."""
+        nasty = "'; rm -rf /; echo '$(whoami)` ${HOME} \\ \" # -- $1"
+        out = self.browse([("user", nasty)] * 20 + [("agent", "ok")])
+
+        self.assertIn("rm -rf /", out)          # printed, not run
+        self.assertNotIn("root", out)
+        self.assertIn("press Enter to resume", out)
 
     def test_shell_metacharacters_in_a_turn_cannot_escape(self):
         """Transcript text is untrusted input being written into a script."""

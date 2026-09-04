@@ -9,6 +9,11 @@ doing. Press Enter and the exact session comes back with full history.
 Panes and tabs are never closed. Only processes inside them are killed, and
 only when the session can be provably resumed from disk.
 
+Set `EXCERPT_TURNS` to a number and a parked pane reprints that many recent
+turns instead of one exchange, framed and scrollable, so you can read back
+through a session without waking it. Speaker labels are dimmed and the words
+are not: a parked pane should look inert, not be hard to read.
+
 ![A parked pane: the last exchange, then the resume banner](docs/img/parked-pane.png)
 
 That is a real parked pane, asked about this repo and then parked with this
