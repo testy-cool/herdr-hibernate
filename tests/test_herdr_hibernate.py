@@ -1034,6 +1034,126 @@ class LastExchangeTests(unittest.TestCase):
         self.assertEqual(hibernate.last_exchange("nope", "claude"), [])
 
 
+class RecentTurnsTests(unittest.TestCase):
+    """Reading back further than the last exchange, for a browsable parked pane."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = self.tempdir.name
+        hibernate._turns_cache.clear()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+        hibernate._turns_cache.clear()
+
+    def write(self, entries, sid="sid"):
+        path = os.path.join(self.root, "%s.jsonl" % sid)
+        with open(path, "w", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(json.dumps(entry) + "\n")
+        spec = dict(hibernate.AGENTS["claude"])
+        spec["transcript_glob"] = os.path.join(self.root, "{sid}.jsonl")
+        return mock.patch.dict(hibernate.AGENTS, {"claude": spec})
+
+    @staticmethod
+    def exchange(n):
+        return [{"type": "user", "message": {"role": "user",
+                                             "content": "prompt %d" % n}},
+                {"type": "assistant",
+                 "message": {"role": "assistant",
+                             "content": [{"type": "text",
+                                          "text": "reply %d" % n}]}}]
+
+    @staticmethod
+    def padding(kb):
+        """A tool result, which every reader drops — file weight, not content."""
+        return {"type": "user", "toolUseResult": {"stdout": "x" * (kb * 1024)},
+                "message": {"role": "user", "content": "tool result"}}
+
+    def test_settings_map_to_a_mode_and_a_count(self):
+        self.assertEqual(hibernate._parse_excerpt_turns("exchange"),
+                         ("exchange", 0))
+        self.assertEqual(hibernate._parse_excerpt_turns("40"), ("turns", 40))
+        self.assertEqual(hibernate._parse_excerpt_turns("all"), ("all", 0))
+        self.assertEqual(hibernate._parse_excerpt_turns("0"), ("exchange", 0))
+        # A typo must leave the pane looking exactly as it did before.
+        self.assertEqual(hibernate._parse_excerpt_turns("forty"),
+                         ("exchange", 0))
+        self.assertEqual(hibernate._parse_excerpt_turns(None), ("exchange", 0))
+
+    def test_the_newest_turns_come_back_in_order(self):
+        entries = [e for n in range(30) for e in self.exchange(n)]
+        with self.write(entries):
+            turns = hibernate.recent_turns("sid", "claude", 6)
+
+        self.assertEqual(turns, [
+            ("user", "prompt 27"), ("agent", "reply 27"),
+            ("user", "prompt 28"), ("agent", "reply 28"),
+            ("user", "prompt 29"), ("agent", "reply 29")])
+
+    def test_a_short_session_returns_everything_it_has(self):
+        entries = [e for n in range(3) for e in self.exchange(n)]
+        with self.write(entries):
+            self.assertEqual(len(hibernate.recent_turns("sid", "claude", 40)), 6)
+
+    def test_zero_means_the_whole_conversation(self):
+        entries = [e for n in range(30) for e in self.exchange(n)]
+        with self.write(entries):
+            self.assertEqual(len(hibernate.recent_turns("sid", "claude", 0)), 60)
+
+    def test_the_window_widens_past_a_wall_of_tool_output(self):
+        """The reason this exists: transcripts are ~1% conversation by weight.
+
+        The last megabyte of this file holds two turns, so a single tail read
+        would silently return two when forty were asked for.
+        """
+        entries = [e for n in range(40) for e in self.exchange(n)]
+        entries += [self.padding(64) for _ in range(24)]  # ~1.5MB of noise
+        entries += self.exchange(99)
+        with self.write(entries):
+            turns = hibernate.recent_turns("sid", "claude", 20)
+
+        self.assertEqual(len(turns), 20)
+        self.assertEqual(turns[-1], ("agent", "reply 99"))
+        self.assertEqual(turns[0], ("user", "prompt 31"))
+
+    def test_an_unchanged_transcript_is_only_read_once(self):
+        """A parked agent is dead, so its transcript cannot move under us.
+
+        The watcher rewrites every stub on every scan, so without this the
+        whole file is reparsed for every parked pane every two minutes.
+        """
+        entries = [e for n in range(5) for e in self.exchange(n)]
+        with self.write(entries):
+            first = hibernate.recent_turns("sid", "claude", 4)
+            with mock.patch.object(hibernate, "_tail_objects") as never:
+                second = hibernate.recent_turns("sid", "claude", 4)
+
+        never.assert_not_called()
+        self.assertEqual(first, second)
+
+    def test_a_rewritten_transcript_is_read_again(self):
+        """The first rewrite after a resume has to see the new turns."""
+        with self.write([e for n in range(3) for e in self.exchange(n)]):
+            hibernate.recent_turns("sid", "claude", 4)
+        longer = [e for n in range(9) for e in self.exchange(n)]
+        with self.write(longer):
+            turns = hibernate.recent_turns("sid", "claude", 4)
+
+        self.assertEqual(turns[-1], ("agent", "reply 8"))
+
+    def test_the_stub_follows_the_configured_mode(self):
+        entries = [e for n in range(20) for e in self.exchange(n)]
+        with self.write(entries):
+            with mock.patch.object(hibernate, "_excerpt_turns",
+                                   ("exchange", 0)):
+                self.assertEqual(len(hibernate._stub_turns("sid", "claude")), 2)
+            with mock.patch.object(hibernate, "_excerpt_turns", ("turns", 8)):
+                self.assertEqual(len(hibernate._stub_turns("sid", "claude")), 8)
+            with mock.patch.object(hibernate, "_excerpt_turns", ("all", 0)):
+                self.assertEqual(len(hibernate._stub_turns("sid", "claude")), 40)
+
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 

@@ -128,7 +128,8 @@ never overwritten.
 | `HIBERNATE_AFTER_MINUTES` | `30` | Idle minutes before a pane qualifies. Raise above 60 if you use scheduled wake-ups. |
 | `DRY_RUN` | `1` | `1` = log only. Set `0` to arm it. |
 | `PIN_MARKER` | `📌` | Any tab or pane label containing this is never parked. |
-| `EXCERPT_LINES` | `all` | `all` reprints the last exchange in full. A number caps each turn; `0` hides it. |
+| `EXCERPT_TURNS` | `exchange` | How far back a parked pane reprints. A number reprints that many recent turns so you can scroll the session; `all` reprints everything. |
+| `EXCERPT_LINES` | `all` | `all` reprints each turn in full. A number caps each turn; `0` hides the excerpt. |
 | `SCAN_INTERVAL_SECONDS` | `120` | Delay between scans in `watch` mode. |
 | `KILL_GRACE_SECONDS` | `5` | Wait after SIGTERM before SIGKILL. |
 | `FORGET_AFTER_MINUTES` | `15` | How long a pane must be *missing* before its record is erased. |
@@ -148,7 +149,9 @@ The conversations are not its data: they are the agents' own transcripts under
 only ever reads. The one copy it makes is the excerpt in each pane's stub
 script. Transcripts contain whatever you pasted into them, keys included, so
 those scripts are `0700` and go when their record does. `EXCERPT_LINES=0` stops
-the copy being made at all.
+the copy being made at all, and `EXCERPT_TURNS` decides how much of the
+conversation it is: the default reprints one exchange, and forty turns is forty
+turns of your session sitting in that file.
 
 ## Known limits
 

@@ -209,6 +209,16 @@ CONFIG_KEYS = [
      "0 hides the excerpt entirely.\n"
      "NOTE: this puts conversation text in ~/.config/herdr-hibernate/panes/,\n"
      "which is why those scripts are owner-only."),
+    ("EXCERPT_TURNS", "exchange",
+     "How much of the conversation a parked pane reprints. `exchange` is the\n"
+     "last prompt and its reply, which is enough to recognise a pane at a\n"
+     "glance. A number reprints that many of the most recent turns instead, so\n"
+     "you can scroll back through the session without resuming it, and `all`\n"
+     "reprints everything. Pair a large value with a small EXCERPT_LINES: forty\n"
+     "turns printed whole is a lot of pane.\n"
+     "NOTE: whatever is reprinted is written to ~/.config/herdr-hibernate/panes/,\n"
+     "so a larger value puts more of the conversation on disk. That is why\n"
+     "those scripts are owner-only."),
     ("BUSY_IGNORE_TOKENS", '"mcp"',
      "Space-separated case-insensitive substrings; a child process whose\n"
      "command line matches one is ignored by the background-job check."),
@@ -231,6 +241,9 @@ _log_max_bytes = 512 * 1024  # updated from LOG_MAX_KB by load_config()
 # line cap with 0 meaning uncapped.
 _excerpt_shown = True
 _excerpt_lines = 0
+# Updated from EXCERPT_TURNS by load_config(): (mode, count) with mode one of
+# "exchange", "turns" or "all". The count means nothing outside "turns".
+_excerpt_turns = ("exchange", 0)
 
 
 def rotate_log():
@@ -285,7 +298,7 @@ def load_config():
         with open(CONFIG_FILE, "a", encoding="utf-8") as fh:
             fh.write("".join(missing))
 
-    global _log_max_bytes, _excerpt_shown, _excerpt_lines
+    global _log_max_bytes, _excerpt_shown, _excerpt_lines, _excerpt_turns
     try:
         _log_max_bytes = int(float(cfg["LOG_MAX_KB"]) * 1024)
     except (ValueError, KeyError):
@@ -293,6 +306,7 @@ def load_config():
     # A global rather than a parameter because write_stub_file is reached from
     # five call sites that have no config in hand — same reason as the log cap.
     _excerpt_shown, _excerpt_lines = _parse_excerpt_lines(cfg.get("EXCERPT_LINES"))
+    _excerpt_turns = _parse_excerpt_turns(cfg.get("EXCERPT_TURNS"))
     return cfg
 
 
@@ -306,6 +320,23 @@ def _parse_excerpt_lines(raw):
     except ValueError:
         return True, 0  # an unreadable setting must not silently hide anything
     return (count > 0), max(0, count)
+
+
+def _parse_excerpt_turns(raw):
+    """(mode, count) for EXCERPT_TURNS; mode is exchange, turns, or all.
+
+    An unreadable setting falls back to "exchange" for the same reason a bad
+    EXCERPT_LINES still prints an excerpt: a typo must change as little as
+    possible, and "exchange" is what every install had before this existed.
+    """
+    word = str(raw if raw is not None else "exchange").strip().strip('"\'').lower()
+    if word in ("all", "full", "-1"):
+        return "all", 0
+    try:
+        count = int(float(word))
+    except ValueError:
+        return "exchange", 0
+    return ("turns", count) if count > 0 else ("exchange", 0)
 
 
 _herdr_bin = None
@@ -496,6 +527,12 @@ def transcript_age_minutes(uuid, agent="claude"):
 
 EXCERPT_TAIL_BYTES = 1024 * 1024
 EXCERPT_WIDE_TAIL_BYTES = 12 * 1024 * 1024
+# Under 2% of a large transcript is anything anybody said; the rest is tool
+# traffic. So reading back for N turns widens in steps instead of parsing tens
+# of megabytes to find forty of them. Measured on two sessions over 50MB, the
+# first window already held 50 and 34 turns. The last window is the whole file.
+TURN_WINDOWS = (EXCERPT_TAIL_BYTES, 4 * EXCERPT_TAIL_BYTES,
+                EXCERPT_WIDE_TAIL_BYTES, float("inf"))
 
 # Pseudo-user entries: hooks, slash-command wrappers, background task results
 # and skill injections all arrive as role "user". None of them is something the
@@ -708,24 +745,92 @@ AGENTS["codex"]["turn_reader"] = _codex_turns
 AGENTS["pi"]["turn_reader"] = _pi_turns
 
 
+def _transcript_path(uuid, agent):
+    """The newest transcript file for a session, or None if it cannot be read.
+
+    Only the MAIN transcript is considered: sub-agent transcripts
+    (activity_globs) are deliberately excluded, because what the supervisor
+    wants to recognise is their own conversation, not a worker's.
+    """
+    spec = AGENTS.get(agent) or {}
+    if spec.get("turn_reader") is None:
+        return None
+    paths = glob.glob(spec["transcript_glob"].format(sid=uuid))
+    if not paths:
+        return None
+    try:
+        return max(paths, key=os.path.getmtime)
+    except OSError:
+        return None
+
+
+# A parked pane's agent is dead, so its transcript cannot change underneath the
+# watcher, which rewrites every stub on every scan. Keyed on the file's mtime
+# and size as well as its path, so the one rewrite after a resume re-reads.
+_turns_cache = {}
+
+
+def recent_turns(uuid, agent="claude", count=0):
+    """The last `count` turns of a session, or the whole thing when count is 0.
+
+    Same [(role, text)] shape as last_exchange, including the synthetic "tools"
+    rows, so both feed the stub renderer unchanged.
+    """
+    path = _transcript_path(uuid, agent)
+    if path is None:
+        return []
+    try:
+        stamp = (path, os.path.getmtime(path), os.path.getsize(path), count)
+    except OSError:
+        return []
+    cached = _turns_cache.get(uuid)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    reader = AGENTS[agent]["turn_reader"]
+    size = stamp[2]
+    try:
+        for window in TURN_WINDOWS:
+            turns = reader(_tail_objects(path, window))
+            # Count only real speech: a window full of tool markers and no
+            # conversation is exactly the case widening exists to fix.
+            said = sum(1 for role, _ in turns if role != "tools")
+            if window >= size or (count and said >= count):
+                break
+    except Exception:  # a transcript schema change must never block a stub
+        return []
+    if count:
+        turns = _last_turns(turns, count)
+    _turns_cache[uuid] = (stamp, turns)
+    return turns
+
+
+def _last_turns(turns, count):
+    """The last `count` spoken turns, keeping the markers that sit between them.
+
+    Slicing the raw list would spend the budget on markers, and could open the
+    excerpt on a lone "12 tool calls" line with nothing above it to explain it.
+    """
+    kept, said = [], 0
+    for row in reversed(turns):
+        if row[0] != "tools":
+            if said >= count:
+                break
+            said += 1
+        kept.append(row)
+    while kept and kept[-1][0] == "tools":
+        kept.pop()  # never open on a marker
+    return list(reversed(kept))
+
+
 def last_exchange(uuid, agent="claude"):
     """[(role, text)] for the tail of a session's conversation, possibly empty.
 
-    Roles are "user" and "agent". Only the MAIN transcript is read: sub-agent
-    transcripts (activity_globs) are deliberately excluded, because what the
-    supervisor wants to recognise is their own conversation, not a worker's.
+    Roles are "user" and "agent".
     """
-    spec = AGENTS.get(agent) or {}
-    reader = spec.get("turn_reader")
-    if reader is None:
+    newest = _transcript_path(uuid, agent)
+    if newest is None:
         return []
-    paths = glob.glob(spec["transcript_glob"].format(sid=uuid))
-    if not paths:
-        return []
-    try:
-        newest = max(paths, key=os.path.getmtime)
-    except OSError:
-        return []
+    reader = AGENTS[agent]["turn_reader"]
     try:
         turns = tail_exchange(reader(_tail_objects(newest)))
         if not {"user", "agent"} <= {role for role, _ in turns}:
@@ -1342,6 +1447,14 @@ def resume_argv(rec):
     return [tok.format(sid=rec["uuid"], cwd=cwd) for tok in spec["resume_argv"]]
 
 
+def _stub_turns(uuid, agent):
+    """What a parked pane reprints, per EXCERPT_TURNS."""
+    mode, count = _excerpt_turns
+    if mode == "exchange":
+        return last_exchange(uuid, agent)
+    return recent_turns(uuid, agent, count if mode == "turns" else 0)
+
+
 def write_stub_file(pane_id, rec):
     """(Re)write the pane's stub script from its state record. Returns its path."""
     os.makedirs(PANES_DIR, mode=0o700, exist_ok=True)
@@ -1354,7 +1467,7 @@ def write_stub_file(pane_id, rec):
         agent, rec["uuid"].split("-")[0], tilde(rec.get("cwd", "")))
     # Re-read on every rewrite (the watcher rewrites each stub every scan) so a
     # session that kept talking before it was parked shows its real last words.
-    turns = last_exchange(rec["uuid"], agent) if _excerpt_shown else []
+    turns = _stub_turns(rec["uuid"], agent) if _excerpt_shown else []
     # Both speakers share one label column, so a long Herdr agent name would
     # otherwise push the reply's text out of line with the prompt's.
     label = (rec.get("agent_name") or agent)[:10]
