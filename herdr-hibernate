@@ -543,6 +543,11 @@ MACHINE_TURN_PREFIXES = (
     "<user-prompt-submit-hook", "<bash-input", "<bash-stdout", "<bash-stderr",
     "<environment_context", "<user_instructions", "# AGENTS.md instructions",
     "Caveat:", "This session is being continued from a previous conversation",
+    # Reading forty turns back rather than two makes these visible: across two
+    # real sessions they were 17 of 80 turns. An interruption is the harness
+    # narrating itself, and a relayed message is another agent talking, which
+    # is worth even less here than a worker's own transcript already is.
+    "[Request interrupted", "Another Claude session sent a message:",
 )
 REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 # Codex appends its memory-citation markup to the message text itself, and it

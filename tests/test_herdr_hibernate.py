@@ -1208,6 +1208,22 @@ class RecentTurnsTests(unittest.TestCase):
             self.assertEqual(hibernate.recent_turns("sid", "claude", 1),
                              [("agent", "two")])
 
+    def test_harness_chatter_is_not_something_you_said(self):
+        """Both of these were 17 of 80 turns across two real sessions."""
+        with self.write([
+            {"type": "user", "message": {"role": "user", "content": "real one"}},
+            {"type": "user", "message": {"role": "user",
+                                         "content": "[Request interrupted by user]"}},
+            {"type": "user", "message": {"role": "user", "content":
+                "Another Claude session sent a message: <teammate-message "
+                "teammate_id=\"w\"> {\"type\":\"idle_notification\"}"}},
+            {"type": "assistant", "message": {"role": "assistant",
+                                              "content": [{"type": "text",
+                                                           "text": "real two"}]}},
+        ]):
+            self.assertEqual(hibernate.recent_turns("sid", "claude", 0),
+                             [("user", "real one"), ("agent", "real two")])
+
     def test_pi_counts_its_camelcase_tool_calls(self):
         turns = hibernate._pi_turns([
             {"type": "message", "message": {"role": "user",
