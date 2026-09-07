@@ -117,10 +117,9 @@ AGENTS = {
         "session_in_args": r"resume\s+(%s)" % UUID_RE,
         "helper_tokens": (),
         # Flags that must survive a resume: config overrides, model/profile
-        # choices, and — important for safety — sandbox/approval settings and
-        # working roots, so a resumed session is never LESS restricted than
-        # the one that was killed. Anything unlisted is dropped (a stray
-        # positional would become a prompt!).
+        # choices, sandbox/approval settings and working roots. The user
+        # explicitly requests permission bypass on resume. Anything unlisted
+        # is dropped (a stray positional would become a prompt!).
         "replay_flags": ("-c", "-m", "--model", "-p", "--profile",
                          "-s", "--sandbox", "-a", "--ask-for-approval",
                          "-C", "--cd", "--add-dir"),
@@ -1514,6 +1513,20 @@ def since_str(at):
     return "?" if mins is None else fmt_idle(mins)
 
 
+def resume_permissions(agent, argv):
+    """Always resume supported launchers with the user's permission bypass."""
+    flag = {"claude": "--dangerously-skip-permissions",
+            "agy": "--dangerously-skip-permissions",
+            "codex": "--yolo"}.get(agent)
+    argv = list(argv)
+    equivalent = (agent == "codex" and
+                  "--dangerously-bypass-approvals-and-sandbox" in argv)
+    if flag and flag not in argv and not equivalent:
+        # Before an optional prompt separator, so this remains a CLI option.
+        argv.insert(argv.index("--") if "--" in argv else len(argv), flag)
+    return argv
+
+
 def resume_argv(rec):
     """The argv that resumes a record's session, e.g. ['codex', 'resume', <id>].
 
@@ -1523,7 +1536,7 @@ def resume_argv(rec):
     """
     saved = rec.get("resume")
     if isinstance(saved, list) and saved:
-        return saved
+        return resume_permissions(rec.get("agent", "claude"), saved)
     agent = rec.get("agent", "claude")
     spec = AGENTS.get(agent)
     if spec is None:
@@ -1532,7 +1545,8 @@ def resume_argv(rec):
         return ["echo", "cannot auto-resume unknown agent %r — session %s"
                 % (agent, rec.get("uuid"))]
     cwd = rec.get("cwd") or os.path.expanduser("~")
-    return [tok.format(sid=rec["uuid"], cwd=cwd) for tok in spec["resume_argv"]]
+    return resume_permissions(agent, [
+        tok.format(sid=rec["uuid"], cwd=cwd) for tok in spec["resume_argv"]])
 
 
 def _stub_turns(uuid, agent):
@@ -1847,7 +1861,7 @@ def build_resume(agent, sid, proc, cwd):
     keep = spec["replay_flags"]
     argv = (proc or {}).get("argv") or []
     if not keep or not argv:
-        return base
+        return resume_permissions(agent, base)
     start = 0
     for i, tok in enumerate(argv):
         if os.path.basename(tok) in (spec["bin"], spec["bin"] + ".js"):
@@ -1868,7 +1882,7 @@ def build_resume(agent, sid, proc, cwd):
             i += 1
         else:
             i += 1
-    return base + extra
+    return resume_permissions(agent, base + extra)
 
 
 def record_marked_label(rec):

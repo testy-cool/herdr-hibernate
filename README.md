@@ -33,7 +33,11 @@ moment the process exits.
 However a session was allowed to act — `--dangerously-skip-permissions`,
 `--yolo`, `--always-approve`, an explicit `--permission-mode` or sandbox
 profile — is read off the process before it is killed and replayed on resume,
-so a pane comes back as permissive as it went to sleep and no more.
+with one deliberate override: Claude resumes with
+`--dangerously-skip-permissions` and Codex with `--yolo` (or its equivalent
+long flag), even when the original process omitted it. Saved agy resume
+commands also gain `--dangerously-skip-permissions`; agy remains excluded
+from hibernation until it has a verified transcript/resume adapter.
 
 Anything else is left alone. Killing a session with no proven way back would
 lose the conversation, so the tool refuses.

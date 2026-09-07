@@ -1847,11 +1847,12 @@ class YoloModeTests(unittest.TestCase):
     def test_claude_keeps_an_explicit_permission_mode(self):
         argv = self.resume("claude", "claude",
                            "--permission-mode", "bypassPermissions")
-        self.assertEqual(argv[-2:], ["--permission-mode", "bypassPermissions"])
+        self.assertEqual(argv[argv.index("--permission-mode"):][:2],
+                         ["--permission-mode", "bypassPermissions"])
 
     def test_claude_keeps_the_model_it_was_started_on(self):
         argv = self.resume("claude", "claude", "--model", "opus")
-        self.assertEqual(argv[-2:], ["--model", "opus"])
+        self.assertEqual(argv[argv.index("--model"):][:2], ["--model", "opus"])
 
     def test_grok_comes_back_auto_approving(self):
         argv = self.resume("grok", "/home/x/.grok/bin/grok", "--always-approve")
@@ -1878,9 +1879,10 @@ class YoloModeTests(unittest.TestCase):
         self.assertNotIn("--bare", argv)
         self.assertNotIn("write me a poem", argv)
 
-    def test_a_plain_session_gains_nothing(self):
+    def test_a_plain_session_resumes_skipping_permissions(self):
         self.assertEqual(self.resume("claude", "claude"),
-                         ["claude", "--resume", self.SID])
+                         ["claude", "--resume", self.SID,
+                          "--dangerously-skip-permissions"])
 
     def test_every_agent_replays_something_for_its_permission_model(self):
         for agent, spec in hibernate.AGENTS.items():
@@ -1972,3 +1974,59 @@ class PiAgentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResumePermissionDefaultsTests(unittest.TestCase):
+    def test_saved_commands_gain_the_flag_without_mutating_the_record(self):
+        for agent, command, flag in (
+            ("claude", ["claude", "--resume", "sid"], "--dangerously-skip-permissions"),
+            ("agy", ["agy", "--conversation", "sid"], "--dangerously-skip-permissions"),
+            ("codex", ["codex", "resume", "sid"], "--yolo"),
+        ):
+            with self.subTest(agent=agent):
+                rec = {"agent": agent, "resume": command}
+                result = hibernate.resume_argv(rec)
+                self.assertEqual(result, command + [flag])
+                self.assertNotIn(flag, command)
+                self.assertEqual(hibernate.resume_permissions(agent, result), result)
+
+    def test_flag_precedes_prompt_separator(self):
+        self.assertEqual(hibernate.resume_permissions("codex", ["codex", "resume", "sid", "--", "prompt"]),
+                         ["codex", "resume", "sid", "--yolo", "--", "prompt"])
+
+    def test_codex_defaults_without_process_arguments(self):
+        self.assertEqual(hibernate.build_resume("codex", "sid", None, "/tmp"),
+                         ["codex", "resume", "sid", "--yolo"])
+
+    def test_old_claude_record_gets_default(self):
+        self.assertEqual(hibernate.resume_argv({"uuid": "sid"}),
+                         ["claude", "--resume", "sid", "--dangerously-skip-permissions"])
+
+
+class ResumeStubExecutionTests(unittest.TestCase):
+    setUp = StubExcerptTests.setUp
+    tearDown = StubExcerptTests.tearDown
+
+    def test_enter_executes_saved_commands_with_permission_bypass(self):
+        for agent, option, flag in (
+            ("claude", "--resume", "--dangerously-skip-permissions"),
+            ("agy", "--conversation", "--dangerously-skip-permissions"),
+            ("codex", "resume", "--yolo"),
+        ):
+            with self.subTest(agent=agent):
+                launcher = os.path.join(self.root, agent)
+                with open(launcher, "w") as stream:
+                    stream.write("#!/bin/sh\nprintf 'ARG:%s\\n' \"$@\"\n")
+                os.chmod(launcher, 0o700)
+                rec = dict(self.rec, agent=agent,
+                           resume=[launcher, option, self.rec["uuid"]])
+                with mock.patch.object(hibernate, "SELF", "/bin/true"), \
+                     mock.patch.object(hibernate, "_excerpt_shown", False):
+                    path = hibernate.write_stub_file("w1:p1", rec)
+                run = subprocess.run(["bash", path], input="\n", text=True,
+                                     capture_output=True, timeout=5,
+                                     env=dict(os.environ, TERM="dumb"))
+                self.assertEqual(run.returncode, 0, run.stderr)
+                args = [line[4:] for line in run.stdout.splitlines()
+                        if line.startswith("ARG:")]
+                self.assertEqual(args, [option, rec["uuid"], flag])
