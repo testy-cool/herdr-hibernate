@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Install this checkout into an existing Linux Herdr Hibernate installation."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def run(*args, cwd=ROOT):
+    return subprocess.check_output(args, cwd=cwd, text=True).strip()
+
+
+def check_resume(root):
+    loader = importlib.machinery.SourceFileLoader('hibernate_check', str(root / 'herdr-hibernate'))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    for agent, flag in [('claude', '--dangerously-skip-permissions'), ('codex', '--yolo')]:
+        args = module.build_resume(agent, 'check-only', None, str(ROOT))
+        if flag not in args:
+            raise RuntimeError(f'{agent} resume command is missing {flag}')
+
+
+def write_json(path, value):
+    # Replace the file in one step, keeping its access permissions.
+    fd, temp = tempfile.mkstemp(dir=path.parent)
+    try:
+        os.fchmod(fd, path.stat().st_mode & 0o777)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, indent=2)
+            stream.write('\n')
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='Run checks and show paths without installing')
+    args = parser.parse_args()
+    config_path = ROOT / '.install-local.json'
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    registry = Path(config.get('registry', '~/.config/herdr/plugins.json')).expanduser().resolve()
+    service = config.get('service', 'herdr-hibernate.service')
+    original = registry.read_bytes()
+    data = json.loads(original)
+    matches = [entry for entry in data if entry.get('plugin_id') == 'bengemine.hibernate']
+    if len(matches) != 1:
+        raise RuntimeError('Expected exactly one Hibernate entry in the plugin registry')
+    entry = matches[0]
+    installed = Path(entry['plugin_root']).expanduser().resolve()
+    if installed == ROOT:
+        raise RuntimeError('Use a separate source checkout, not the installed plugin folder')
+    for root in (ROOT, installed):
+        if run('git', 'status', '--porcelain', cwd=root):
+            raise RuntimeError(f'Commit or set aside unfinished changes first: {root}')
+    commit = run('git', 'rev-parse', 'HEAD')
+    previous = run('git', 'rev-parse', 'HEAD', cwd=installed)
+    source = entry.get('source', {})
+    if source.get('kind') != 'github' or Path(source.get('managed_path', '')).resolve() != installed:
+        raise RuntimeError('Expected a GitHub plugin whose managed path matches its installed folder')
+    command = run('systemctl', '--user', 'show', service, '--property=ExecStart', '--value')
+    if str(installed / 'herdr-hibernate') + ' watch' not in command:
+        raise RuntimeError('The service does not run the installed Hibernate watcher')
+    run('systemctl', '--user', 'is-active', service)
+    subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-q'], cwd=ROOT, check=True)
+    check_resume(ROOT)
+    print(f'Source: {ROOT}\nInstalled: {installed}\nRegistry: {registry}\nService: {service}\nCommit: {commit}', flush=True)
+    if args.check:
+        print('Checks passed. Nothing was installed.')
+        return
+    backup = Path(tempfile.mkdtemp(prefix='hibernate-install-', dir=registry.parent))
+    shutil.copy2(registry, backup / 'plugins.json')
+    (backup / 'rollback.json').write_text(json.dumps({'installed': str(installed), 'commit': previous, 'service': service}, indent=2) + '\n')
+    print(f'Backup: {backup}', flush=True)
+    run('git', 'fetch', '--no-tags', str(ROOT), commit, cwd=installed)
+    try:
+        run('git', 'checkout', '--detach', commit, cwd=installed)
+        source['requested_ref'] = commit
+        source['resolved_commit'] = commit
+        # Remove stray fields from an older manual install. Herdr stores these under source.
+        entry.pop('requested_ref', None)
+        entry.pop('resolved_commit', None)
+        if registry.read_bytes() != original:
+            raise RuntimeError('The plugin registry changed during installation; try again')
+        write_json(registry, data)
+        run('systemctl', '--user', 'restart', service)
+        run('systemctl', '--user', 'is-active', service)
+        check_resume(installed)
+        if run('git', 'rev-parse', 'HEAD', cwd=installed) != commit:
+            raise RuntimeError('Installed commit does not match')
+        current = json.loads(registry.read_text())
+        saved = next(item for item in current if item.get('plugin_id') == 'bengemine.hibernate')
+        if saved['source']['resolved_commit'] != commit:
+            raise RuntimeError('Plugin registry commit does not match')
+    except Exception:
+        # Keep other plugin entries if they changed while this script ran.
+        current = json.loads(registry.read_text())
+        old_entry = next(item for item in json.loads(original) if item.get('plugin_id') == 'bengemine.hibernate')
+        for i, item in enumerate(current):
+            if item.get('plugin_id') == 'bengemine.hibernate':
+                current[i] = old_entry
+        write_json(registry, current)
+        run('git', 'checkout', '--detach', previous, cwd=installed)
+        run('systemctl', '--user', 'restart', service)
+        raise
+    print('Installed and checked. The watcher is running.')
+    print('Already-running parked stubs keep their old commands until reloaded.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        sys.exit(f'Install failed: {error}')

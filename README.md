@@ -187,3 +187,7 @@ and how the excerpt is built.
 This is a fork of [bengemine/herdr-hibernate](https://github.com/bengemine/herdr-hibernate),
 which has not been updated since 3 August 2026. It adds workspace hibernation,
 Codex flag preservation, and the parked-pane excerpt. MIT licensed.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for testing and local install steps.
