@@ -1418,9 +1418,9 @@ _hb_pack() {{  # $1 colour, $2 first indent, $3 hanging indent, $4 text
     unset -f _hb_emit
     return 0
 }}
-_hb_turn() {{  # $1 speaker, $2 text, $3 max lines (0 = all), $4 label column
+_hb_turn() {{  # $1 speaker, $2 text, $3 max lines (0 = all), $4 label column, $5 label colour
     [ -z "$2" ] && return 0
-    local width wrapped shown=0 line
+    local width wrapped shown=0 line lc=${{5:-\\033[2m}}
     width=$(( $(_hb_cols) - $4 - 4 ))
     [ "$width" -lt 30 ] && width=30
     wrapped=$(printf '%s\n' "$2" | fold -s -w "$width" 2>/dev/null) || wrapped=$2
@@ -1429,8 +1429,8 @@ _hb_turn() {{  # $1 speaker, $2 text, $3 max lines (0 = all), $4 label column
             printf "  \033[2m%-$4s …\033[0m\n" ''
             break
         fi
-        [ "$shown" -gt 0 ] && set -- '' "$2" "$3" "$4"
-        printf "  \033[2m%-$4s\033[0m %s\n" "$1" "$line"
+        [ "$shown" -gt 0 ] && set -- '' "$2" "$3" "$4" "$5"
+        printf "  %b%-$4s\033[0m %s\n" "$lc" "$1" "$line"
         shown=$(( shown + 1 ))
     done <<< "$wrapped"
 }}
@@ -1632,6 +1632,7 @@ def render_excerpt(turns, label):
     lines = ["printf '\\n'"]
     if heading:
         lines += ["_hb_rule %s" % shlex.quote(heading), "printf '\\n'"]
+    prev_role = None
     for role, text in turns:
         if role == "cut":
             continue  # a fact for the heading, not a line of its own
@@ -1640,10 +1641,16 @@ def render_excerpt(turns, label):
             # long reply from reading as an instant answer, and it is the only
             # thing here that is not something one of you said.
             lines.append("_hb_mark %s %s" % (shlex.quote(text), pad))
+            prev_role = role
             continue
-        lines.append("_hb_turn %s %s %s %s" % (
+        if prev_role and prev_role != role:
+            lines.append("printf '\\n'")
+        colour = r"\033[36m" if role == "user" else r"\033[2m"
+        lines.append("_hb_turn %s %s %s %s %s" % (
             shlex.quote("you" if role == "user" else label),
-            shlex.quote(text), _excerpt_lines, pad))
+            shlex.quote(text), _excerpt_lines, pad,
+            shlex.quote(colour)))
+        prev_role = role
     if heading:
         lines += ["printf '\\n'", "_hb_rule ''"]
     return "\n    ".join(lines)
@@ -2486,11 +2493,11 @@ def cmd_hibernate(pane_id, force=False, notify=False):
     if decision == "exempt":
         fail("refusing: %s" % reason)
     if decision == "skip" and not reason.startswith("idle only"):
-        # `--force` may override the background-job guard — an explicit request
-        # is not a mistake — but nothing else.
-        if force and reason.startswith("busy:"):
-            log("force: overriding background-job guard on %s (%s)" % (
-                pane_id, reason))
+        # `--force` overrides guards that protect against accidental kills —
+        # an explicit request is not a mistake.
+        if force and (reason.startswith("busy:")
+                      or reason.startswith("pane last drawn")):
+            log("force: overriding guard on %s (%s)" % (pane_id, reason))
         else:
             fail("cannot hibernate: %s" % reason)
     uuid = session_uuid(pane)

@@ -1357,15 +1357,16 @@ class StubExcerptTests(unittest.TestCase):
         self.assertLess(out.index("The rewrite rule was wrong."),
                         out.index("press Enter to resume"))
 
-    def test_the_speaker_is_dim_and_the_words_are_not(self):
-        """Dim marks a pane as parked. It must not make it hard to read.
+    def test_speakers_are_visually_distinct(self):
+        """Different colours let the eye jump between turns at a glance.
 
-        Forty turns of low-contrast grey is a different proposition from four
-        lines of it, and the words are what you scrolled back for.
+        The user label is cyan, the agent label is dim, and neither colour
+        leaks into the text itself — the words stay normal weight.
         """
         _, out = self.render("a question", "an answer")
-        self.assertIn("\x1b[2myou", out)            # the speaker is dim
-        self.assertIn("\x1b[0m a question", out)    # the words are not
+        self.assertIn("\x1b[36myou", out)            # user label is cyan
+        self.assertIn("\x1b[2mclaude", out)          # agent label is dim
+        self.assertIn("\x1b[0m a question", out)     # the words are not coloured
         self.assertNotIn("a question\x1b[0m", out)
 
     def browse(self, turns, mode=("turns", 40), columns="80"):
