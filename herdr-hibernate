@@ -2493,13 +2493,16 @@ def cmd_hibernate(pane_id, force=False, notify=False):
     if decision == "exempt":
         fail("refusing: %s" % reason)
     if decision == "skip" and not reason.startswith("idle only"):
-        # `--force` overrides guards that protect against accidental kills —
-        # an explicit request is not a mistake. The status, drawn-recently
-        # and busy-job guards are all things the watcher checks automatically
-        # but the user may know better about.
-        if force and (reason.startswith("busy:")
-                      or reason.startswith("pane last drawn")
-                      or reason.startswith("status ")):
+        # The only skip reasons --force cannot override are the ones where
+        # hibernation is structurally impossible: no agent, no session id
+        # (nothing to resume), not a uuid (ambiguous resume). Everything
+        # else — status, transcript age, terminal activity, background
+        # jobs — is the user's call when they explicitly ask.
+        hard = (reason.startswith("no agent")
+                or reason.startswith("Herdr has not reported")
+                or reason.startswith("session id")
+                or reason.startswith("hibernated"))
+        if force and not hard:
             log("force: overriding guard on %s (%s)" % (pane_id, reason))
         else:
             fail("cannot hibernate: %s" % reason)
