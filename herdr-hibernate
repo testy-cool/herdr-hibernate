@@ -2494,9 +2494,12 @@ def cmd_hibernate(pane_id, force=False, notify=False):
         fail("refusing: %s" % reason)
     if decision == "skip" and not reason.startswith("idle only"):
         # `--force` overrides guards that protect against accidental kills —
-        # an explicit request is not a mistake.
+        # an explicit request is not a mistake. The status, drawn-recently
+        # and busy-job guards are all things the watcher checks automatically
+        # but the user may know better about.
         if force and (reason.startswith("busy:")
-                      or reason.startswith("pane last drawn")):
+                      or reason.startswith("pane last drawn")
+                      or reason.startswith("status ")):
             log("force: overriding guard on %s (%s)" % (pane_id, reason))
         else:
             fail("cannot hibernate: %s" % reason)
