@@ -1360,12 +1360,12 @@ class StubExcerptTests(unittest.TestCase):
     def test_speakers_are_visually_distinct(self):
         """Different colours let the eye jump between turns at a glance.
 
-        The user label is cyan, the agent label is dim, and neither colour
-        leaks into the text itself — the words stay normal weight.
+        The user label is cyan, the agent label is its own brand colour
+        (magenta for claude), and neither leaks into the text itself.
         """
         _, out = self.render("a question", "an answer")
         self.assertIn("\x1b[36myou", out)            # user label is cyan
-        self.assertIn("\x1b[2mclaude", out)          # agent label is dim
+        self.assertIn("\x1b[35mclaude", out)         # claude label is magenta
         self.assertIn("\x1b[0m a question", out)     # the words are not coloured
         self.assertNotIn("a question\x1b[0m", out)
 

@@ -96,6 +96,7 @@ AGENTS = {
         "activity_globs": (
             os.path.expanduser("~/.claude/projects/*/{sid}/subagents/*.jsonl"),),
         "bin": "claude",
+        "label_colour": r"\033[35m",  # magenta
         "resume_argv": ["claude", "--resume", "{sid}"],
         "session_in_args": r"--resume\s+(%s)" % UUID_RE,
         "helper_tokens": ("bg-pty-host", "bg-spare", " daemon "),
@@ -113,6 +114,7 @@ AGENTS = {
         "transcript_glob": os.path.expanduser(
             "~/.codex/sessions/*/*/*/rollout-*-{sid}.jsonl"),
         "bin": "codex",
+        "label_colour": r"\033[32m",  # green
         "resume_argv": ["codex", "resume", "{sid}"],
         "session_in_args": r"resume\s+(%s)" % UUID_RE,
         "helper_tokens": (),
@@ -133,6 +135,7 @@ AGENTS = {
         "transcript_glob": os.path.expanduser(
             "~/.pi/agent/sessions/*/*_{sid}.jsonl"),
         "bin": "pi",
+        "label_colour": r"\033[33m",  # yellow
         # By absolute path, never by bare id: pi resolves an id against the
         # CURRENT project, so resuming from anywhere else stops at an
         # interactive "Fork this session? [y/N]", which would hang the pane.
@@ -151,6 +154,7 @@ AGENTS = {
         # under a percent-encoded copy of the session's cwd.
         "transcript_glob": os.path.expanduser("~/.grok/sessions/*/{sid}/*.jsonl"),
         "bin": "grok",
+        "label_colour": r"\033[31m",  # red
         # Session ids are global across cwds, but --cwd sidesteps a legacy
         # duplicate-id edge case in grok's sandbox-profile lookup.
         "resume_argv": ["grok", "--resume", "{sid}", "--cwd", "{cwd}"],
@@ -1583,7 +1587,7 @@ def write_stub_file(pane_id, rec):
         cwd=shlex.quote(rec.get("cwd") or os.path.expanduser("~")),
         banner=shlex.quote(banner),
         subtitle=shlex.quote(subtitle),
-        excerpt=render_excerpt(turns, label),
+        excerpt=render_excerpt(turns, label, agent),
         tool=shlex.quote(SELF),
     )
     tmp = path + ".tmp"
@@ -1620,7 +1624,7 @@ def _excerpt_heading(turns):
     return "💤 parked · the last %d turns" % said
 
 
-def render_excerpt(turns, label):
+def render_excerpt(turns, label, agent="claude"):
     """The shell lines that print an excerpt, ready to drop into the stub."""
     if not turns:
         return ":"  # nothing to say; keep the template a valid statement
@@ -1645,7 +1649,8 @@ def render_excerpt(turns, label):
             continue
         if prev_role and prev_role != role:
             lines.append("printf '\\n'")
-        colour = r"\033[36m" if role == "user" else r"\033[2m"
+        agent_colour = AGENTS.get(agent, {}).get("label_colour", r"\033[2m")
+        colour = r"\033[36m" if role == "user" else agent_colour
         lines.append("_hb_turn %s %s %s %s %s" % (
             shlex.quote("you" if role == "user" else label),
             shlex.quote(text), _excerpt_lines, pad,
