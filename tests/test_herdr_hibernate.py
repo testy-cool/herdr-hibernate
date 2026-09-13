@@ -1365,7 +1365,7 @@ class StubExcerptTests(unittest.TestCase):
         """
         _, out = self.render("a question", "an answer")
         self.assertIn("\x1b[36myou", out)            # user label is cyan
-        self.assertIn("\x1b[35mclaude", out)         # claude label is magenta
+        self.assertIn("\x1b[38;2;230;138;103mclaude", out)  # claude label is sidebar orange
         self.assertIn("\x1b[0m a question", out)     # the words are not coloured
         self.assertNotIn("a question\x1b[0m", out)
 

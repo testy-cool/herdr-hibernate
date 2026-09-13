@@ -96,7 +96,7 @@ AGENTS = {
         "activity_globs": (
             os.path.expanduser("~/.claude/projects/*/{sid}/subagents/*.jsonl"),),
         "bin": "claude",
-        "label_colour": r"\033[35m",  # magenta
+        "label_colour": r"\033[38;2;230;138;103m",  # #E68A67 — sidebar orange
         "resume_argv": ["claude", "--resume", "{sid}"],
         "session_in_args": r"--resume\s+(%s)" % UUID_RE,
         "helper_tokens": ("bg-pty-host", "bg-spare", " daemon "),
@@ -114,7 +114,7 @@ AGENTS = {
         "transcript_glob": os.path.expanduser(
             "~/.codex/sessions/*/*/*/rollout-*-{sid}.jsonl"),
         "bin": "codex",
-        "label_colour": r"\033[32m",  # green
+        "label_colour": r"\033[38;2;167;139;250m",  # #A78BFA — sidebar purple
         "resume_argv": ["codex", "resume", "{sid}"],
         "session_in_args": r"resume\s+(%s)" % UUID_RE,
         "helper_tokens": (),
@@ -135,7 +135,7 @@ AGENTS = {
         "transcript_glob": os.path.expanduser(
             "~/.pi/agent/sessions/*/*_{sid}.jsonl"),
         "bin": "pi",
-        "label_colour": r"\033[33m",  # yellow
+        "label_colour": r"\033[33m",  # yellow (no sidebar entry yet)
         # By absolute path, never by bare id: pi resolves an id against the
         # CURRENT project, so resuming from anywhere else stops at an
         # interactive "Fork this session? [y/N]", which would hang the pane.
